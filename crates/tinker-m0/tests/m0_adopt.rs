@@ -298,3 +298,84 @@ async fn adopted_rows_keep_rls_data_isolation() {
     tx.commit().await.unwrap();
     assert_eq!(count, 0, "adopter sees only its own rows via RLS");
 }
+
+/// Migration 0045: visibility is not writability. Through the app role
+/// (tenant tx), an adopter can READ the definer's base field rows and
+/// every tenant can READ platform objects, but neither may be written.
+/// Before 0045 the FOR ALL / USING-only policies let both UPDATEs land.
+#[tokio::test]
+async fn visible_shared_and_platform_rows_are_not_writable_by_tenants() {
+    let env = common::setup().await;
+    let ont = ontology(&env);
+    let slug = common::uniq("contact");
+    let (_ctx_a, root_id) = define_shared(&env, &ont, &slug).await;
+    let ctx_b = common::new_org(&env, &common::uniq("org")).await;
+    ont.adopt_object(&ctx_b, &slug).await.unwrap();
+
+    // A platform object (owner-inserted, as the pack installer would).
+    let platform_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO ontology_objects (id, scope_kind, name, api_slug, label) \
+         VALUES ($1, 'platform', 'Base', $2, 'Base')",
+    )
+    .bind(platform_id)
+    .bind(common::uniq("base"))
+    .execute(&env.core_owner)
+    .await
+    .unwrap();
+
+    let mut tx = env.core.tenant_tx(&ctx_b).await.unwrap();
+    let visible_fields: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ontology_fields WHERE object_id=$1")
+            .bind(root_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(
+        visible_fields, 1,
+        "adopter still sees the shared base field"
+    );
+    let visible_platform: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM ontology_objects WHERE id=$1")
+            .bind(platform_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(visible_platform, 1, "platform objects stay visible");
+
+    for (sql, id) in [
+        (
+            "UPDATE ontology_fields SET label='pwned' WHERE object_id=$1",
+            root_id,
+        ),
+        ("DELETE FROM ontology_fields WHERE object_id=$1", root_id),
+        (
+            "UPDATE ontology_objects SET label='pwned' WHERE id=$1",
+            platform_id,
+        ),
+        ("DELETE FROM ontology_objects WHERE id=$1", platform_id),
+    ] {
+        let n = sqlx::query(sql)
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .unwrap()
+            .rows_affected();
+        assert_eq!(n, 0, "tenant write must not reach a foreign row: {sql}");
+    }
+    tx.commit().await.unwrap();
+
+    // The library path fails closed the same way (no existence oracle).
+    let err = ont
+        .rename_object(&ctx_b, platform_id, "Hijacked", "Hijacked")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TinkerError::NotFound(_)), "got {err:?}");
+
+    let label: String = sqlx::query_scalar("SELECT label FROM ontology_objects WHERE id=$1")
+        .bind(platform_id)
+        .fetch_one(&env.core_owner)
+        .await
+        .unwrap();
+    assert_eq!(label, "Base");
+}
