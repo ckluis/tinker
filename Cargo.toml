@@ -79,6 +79,9 @@ jsonwebtoken = "9"
 base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
+# WebAuthn: CBOR (attestation objects, COSE keys) + ES256 verification.
+ciborium = "0.2"
+p256 = { version = "0.13", features = ["ecdsa"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tinker-core = { path = "crates/tinker-core" }
 tinker-db = { path = "crates/tinker-db" }

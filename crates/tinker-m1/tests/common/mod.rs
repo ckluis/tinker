@@ -140,6 +140,24 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8(out).unwrap()
 }
 
+/// The relying party the m1 router verifies passkeys against
+/// (`build_state` derives it from host `tinker.test`).
+#[allow(dead_code)]
+pub fn rp() -> tinker_auth::webauthn::RelyingParty {
+    tinker_auth::webauthn::RelyingParty {
+        id: "tinker.test".into(),
+        origins: vec!["https://tinker.test".into()],
+    }
+}
+
+/// A user-verified WebAuthn assertion over `challenge`, as a browser +
+/// authenticator would produce it: (client_data_json, authenticator_data,
+/// signature), base64url.
+#[allow(dead_code)]
+pub fn assertion(key: &SigningKey, challenge: &[u8]) -> (String, String, String) {
+    tinker_auth::webauthn::soft_authenticator::ed25519_assertion(key, &rp(), challenge, 0, true)
+}
+
 /// Nonce used by tests that call the adapter directly (no login attempt).
 #[allow(dead_code)]
 pub const TEST_NONCE: &str = "m1-test-nonce";
@@ -434,7 +452,10 @@ pub async fn setup() -> Env {
     }
 
     let broker = AuthBroker::new(vec![
-        Box::new(PasskeyAdapter::new(PgPasskeyStore::new(tenant.clone()))),
+        Box::new(PasskeyAdapter::new(
+            PgPasskeyStore::new(tenant.clone()),
+            rp(),
+        )),
         Box::new(OidcAdapter::new(
             PgOidcBindingStore::new(system.clone()),
             oidc_config(),
@@ -467,7 +488,6 @@ pub async fn setup() -> Env {
 /// Full passkey ceremony over HTTP. Returns the session cookie value.
 pub async fn passkey_login(router: &axum::Router, org: &OrgCtx) -> String {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use ed25519_dalek::Signer;
 
     let start_body = serde_json::json!({
         "organization_id": org.org_id.to_string(),
@@ -491,14 +511,16 @@ pub async fn passkey_login(router: &axum::Router, org: &OrgCtx) -> String {
 
     let challenge_b64 = start["challenge"].as_str().unwrap();
     let challenge = URL_SAFE_NO_PAD.decode(challenge_b64).unwrap();
-    let sig = org.signing_key.sign(&challenge).to_bytes();
+    let a = assertion(&org.signing_key, &challenge);
 
     let finish_body = serde_json::json!({
         "organization_id": org.org_id.to_string(),
         "workspace_id": org.workspace_id.to_string(),
         "credential_id": org.credential_id,
         "challenge_id": start["challenge_id"].as_str().unwrap(),
-        "signature": URL_SAFE_NO_PAD.encode(sig),
+        "client_data_json": a.0,
+        "authenticator_data": a.1,
+        "signature": a.2,
     });
     let res = router
         .clone()

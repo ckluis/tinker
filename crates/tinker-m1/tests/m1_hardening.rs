@@ -84,7 +84,6 @@ async fn tampered_cookie_is_rejected() {
 #[tokio::test]
 async fn passkey_challenge_replay_fails() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use ed25519_dalek::Signer;
 
     let env = setup().await;
     let org = &env.org_a;
@@ -111,7 +110,7 @@ async fn passkey_challenge_replay_fails() {
     let challenge = URL_SAFE_NO_PAD
         .decode(start["challenge"].as_str().unwrap())
         .unwrap();
-    let sig = URL_SAFE_NO_PAD.encode(org.signing_key.sign(&challenge).to_bytes());
+    let a = common::assertion(&org.signing_key, &challenge);
 
     let finish = || {
         let body = serde_json::json!({
@@ -119,7 +118,9 @@ async fn passkey_challenge_replay_fails() {
             "workspace_id": org.workspace_id.to_string(),
             "credential_id": org.credential_id,
             "challenge_id": start["challenge_id"].as_str().unwrap(),
-            "signature": sig,
+            "client_data_json": a.0,
+            "authenticator_data": a.1,
+            "signature": a.2,
         });
         env.router.clone().oneshot(
             Request::builder()
@@ -136,6 +137,9 @@ async fn passkey_challenge_replay_fails() {
     assert_eq!(second.status(), StatusCode::UNAUTHORIZED, "replay rejected");
 }
 
+/// Builds the ID token a (simulated) provider returns for a nonce.
+type TokenFor<'a> = Box<dyn Fn(&str) -> String + 'a>;
+
 /// An OIDC token for the wrong audience, expired, for an unknown
 /// subject, or answering a different login attempt never authenticates —
 /// even when it arrives through a real code-flow callback.
@@ -144,7 +148,7 @@ async fn oidc_token_abuse_fails_closed() {
     let env = setup().await;
     let org = &env.org_a;
     let sub = org.oidc_subject.clone();
-    let cases: Vec<(&str, Box<dyn Fn(&str) -> String>)> = vec![
+    let cases: Vec<(&str, TokenFor)> = vec![
         (
             "audience",
             Box::new(|n: &str| common::mint_id_token_for(&sub, "wrong-audience", 300, n)),
@@ -450,7 +454,6 @@ async fn render_requires_app_view_grant() {
 #[tokio::test]
 async fn concurrent_challenge_consumption_has_exactly_one_winner() {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use ed25519_dalek::Signer;
 
     let env = setup().await;
     let org = &env.org_a;
@@ -477,7 +480,7 @@ async fn concurrent_challenge_consumption_has_exactly_one_winner() {
     let challenge = URL_SAFE_NO_PAD
         .decode(start["challenge"].as_str().unwrap())
         .unwrap();
-    let sig = URL_SAFE_NO_PAD.encode(org.signing_key.sign(&challenge).to_bytes());
+    let a = common::assertion(&org.signing_key, &challenge);
     let challenge_id = start["challenge_id"].as_str().unwrap().to_string();
 
     let mut handles = Vec::new();
@@ -487,14 +490,16 @@ async fn concurrent_challenge_consumption_has_exactly_one_winner() {
         let ws_id = org.workspace_id.to_string();
         let cred_id = org.credential_id.clone();
         let challenge_id = challenge_id.clone();
-        let sig = sig.clone();
+        let a = a.clone();
         handles.push(tokio::spawn(async move {
             let body = serde_json::json!({
                 "organization_id": org_id,
                 "workspace_id": ws_id,
                 "credential_id": cred_id,
                 "challenge_id": challenge_id,
-                "signature": sig,
+                "client_data_json": a.0,
+            "authenticator_data": a.1,
+            "signature": a.2,
             });
             router
                 .oneshot(
@@ -770,5 +775,155 @@ async fn session_dies_with_membership() {
         res.status(),
         StatusCode::SEE_OTHER,
         "ex-member is bounced to /login"
+    );
+}
+
+async fn post_json(
+    env: &common::Env,
+    uri: &str,
+    cookie: Option<&str>,
+    body: serde_json::Value,
+) -> axum::response::Response {
+    let mut req = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(c) = cookie {
+        req = req.header(
+            header::COOKIE,
+            format!("{}={c}", tinker_web::SESSION_COOKIE),
+        );
+    }
+    env.router
+        .clone()
+        .oneshot(req.body(axum::body::Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap()
+}
+
+/// Assurance recorded on the actor's newest passkey session.
+async fn latest_passkey_assurance(env: &common::Env, actor: uuid::Uuid) -> String {
+    sqlx::query_scalar(
+        "SELECT assurance FROM sessions WHERE actor_id = $1 AND method = 'passkey' \
+         ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(actor)
+    .fetch_one(&env.system)
+    .await
+    .unwrap()
+}
+
+async fn json_body(res: axum::response::Response) -> serde_json::Value {
+    serde_json::from_slice(&axum::body::to_bytes(res.into_body(), 16384).await.unwrap()).unwrap()
+}
+
+/// Real WebAuthn end to end: a signed-in user registers a passkey
+/// (navigator.credentials.create shape), then logs in with it; a
+/// user-verified assertion is multi-factor, presence-only is single-
+/// factor, and an assertion from another origin (phishing) is refused.
+#[tokio::test]
+async fn webauthn_register_then_login_binds_origin_and_assurance() {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use tinker_auth::webauthn::soft_authenticator as soft;
+    let env = setup().await;
+    let org = &env.org_a;
+    let session = common::oidc_login(&env, org).await;
+
+    // Registration needs a session.
+    let res = post_json(&env, "/passkey/register/start", None, serde_json::json!({})).await;
+    assert_ne!(
+        res.status(),
+        StatusCode::OK,
+        "anonymous registration refused"
+    );
+    let start = json_body(
+        post_json(
+            &env,
+            "/passkey/register/start",
+            Some(&session),
+            serde_json::json!({}),
+        )
+        .await,
+    )
+    .await;
+    let challenge = URL_SAFE_NO_PAD
+        .decode(start["challenge"].as_str().unwrap())
+        .unwrap();
+    let key = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let cred_raw = format!("cred-{}", uuid::Uuid::now_v7().simple()).into_bytes();
+    let (cd, att) = soft::ed25519_registration(&key, &common::rp(), &challenge, &cred_raw);
+    let res = post_json(
+        &env,
+        "/passkey/register/finish",
+        Some(&session),
+        serde_json::json!({ "challenge_id": start["challenge_id"], "client_data_json": cd, "attestation_object": att }),
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::CREATED);
+    let cred_id = json_body(res).await["credential_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Login with the new passkey: assertion over a fresh challenge.
+    let login = |rp: tinker_auth::webauthn::RelyingParty, uv: bool, counter: u32| {
+        let (env, key, cred_id) = (&env, &key, cred_id.clone());
+        async move {
+            let start = json_body(
+                post_json(
+                    env,
+                    "/login/passkey/start",
+                    None,
+                    serde_json::json!({ "organization_id": org.org_id, "actor_id": org.actor_id }),
+                )
+                .await,
+            )
+            .await;
+            let challenge = URL_SAFE_NO_PAD
+                .decode(start["challenge"].as_str().unwrap())
+                .unwrap();
+            let a = soft::ed25519_assertion(key, &rp, &challenge, counter, uv);
+            post_json(
+                env,
+                "/login/passkey/finish",
+                None,
+                serde_json::json!({
+                    "organization_id": org.org_id, "workspace_id": org.workspace_id,
+                    "credential_id": cred_id, "challenge_id": start["challenge_id"],
+                    "client_data_json": a.0, "authenticator_data": a.1, "signature": a.2,
+                }),
+            )
+            .await
+        }
+    };
+    let phishing = tinker_auth::webauthn::RelyingParty {
+        id: "tinker.test".into(),
+        origins: vec!["https://tinker-login.evil".into()],
+    };
+    assert_eq!(
+        login(phishing, true, 1).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "phishing origin"
+    );
+
+    let res = login(common::rp(), true, 1).await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER, "verified login");
+    assert!(res.headers().get(header::SET_COOKIE).is_some());
+    assert_eq!(
+        latest_passkey_assurance(&env, org.actor_id).await,
+        "multi_factor"
+    );
+    // Counter must advance: replaying counter 1 is a cloned-key signal.
+    assert_eq!(
+        login(common::rp(), true, 1).await.status(),
+        StatusCode::UNAUTHORIZED,
+        "counter replay"
+    );
+    let res = login(common::rp(), false, 2).await;
+    assert_eq!(res.status(), StatusCode::SEE_OTHER, "presence-only login");
+    assert!(res.headers().get(header::SET_COOKIE).is_some());
+    assert_eq!(
+        latest_passkey_assurance(&env, org.actor_id).await,
+        "single_factor"
     );
 }

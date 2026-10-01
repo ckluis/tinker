@@ -25,18 +25,17 @@ use tinker_identity::{Authorizer, PgOidcBindingStore, PgPasskeyStore};
 
 async fn authn_via_passkey(env: &common::Env) -> AuthnContext {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-    use ed25519_dalek::Signer;
 
     let org = &env.org_a;
     let store = PgPasskeyStore::new(env.tenant.clone());
-    let adapter = PasskeyAdapter::new(store);
+    let adapter = PasskeyAdapter::new(store, common::rp());
     let (cid, challenge_b64) = env
         .sessions
         .mint_passkey_challenge(org.org_id, org.actor_id)
         .await
         .unwrap();
     let challenge = URL_SAFE_NO_PAD.decode(&challenge_b64).unwrap();
-    let sig = org.signing_key.sign(&challenge).to_bytes();
+    let a = common::assertion(&org.signing_key, &challenge);
     adapter
         .authenticate(&Credential {
             kind: CredentialKind::WebAuthn,
@@ -44,7 +43,9 @@ async fn authn_via_passkey(env: &common::Env) -> AuthnContext {
                 "organization_id": org.org_id.to_string(),
                 "credential_id": org.credential_id,
                 "challenge_id": cid.to_string(),
-                "signature": URL_SAFE_NO_PAD.encode(sig),
+                "client_data_json": a.0,
+                "authenticator_data": a.1,
+                "signature": a.2,
             }),
         })
         .await
@@ -213,11 +214,15 @@ async fn broker_adapter_set_is_swappable() {
 
     let broker_passkey_only = AuthBroker::new(vec![Box::new(PasskeyAdapter::new(
         PgPasskeyStore::new(env.tenant.clone()),
+        common::rp(),
     ))]);
     assert_eq!(broker_passkey_only.methods(), vec!["passkey"]);
 
     let broker_both = AuthBroker::new(vec![
-        Box::new(PasskeyAdapter::new(PgPasskeyStore::new(env.tenant.clone()))),
+        Box::new(PasskeyAdapter::new(
+            PgPasskeyStore::new(env.tenant.clone()),
+            common::rp(),
+        )),
         Box::new(OidcAdapter::new(
             PgOidcBindingStore::new(env.system.clone()),
             oidc_config(),

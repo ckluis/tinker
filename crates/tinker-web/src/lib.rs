@@ -95,6 +95,9 @@ pub struct AppState {
     /// (docs/pii-sensitive-fields.md). `None`: sensitive writes, lookups
     /// and reveals fail closed.
     pub pii: Option<tinker_ontology::sensitive::PiiSealer>,
+    /// WebAuthn relying party (RP ID + allowed origins) for passkey
+    /// registration; login verification uses the adapter's own copy.
+    pub rp: tinker_auth::webauthn::RelyingParty,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -112,6 +115,8 @@ pub fn build_router_with_oidc(state: SharedState, oidc: Option<oidc_flow::OidcCl
         .route("/login", get(login_page))
         .route("/login/passkey/start", post(passkey_start))
         .route("/login/passkey/finish", post(passkey_finish))
+        .route("/passkey/register/start", post(passkey_register_start))
+        .route("/passkey/register/finish", post(passkey_register_finish))
         .route("/login/oidc/start", get(oidc_flow::start))
         .route("/login/oidc/callback", get(oidc_flow::callback))
         .route("/logout", post(logout))
@@ -345,6 +350,7 @@ struct PasskeyStart {
 struct PasskeyStartResponse {
     challenge_id: String,
     challenge: String,
+    rp_id: String,
 }
 
 async fn passkey_start(
@@ -359,6 +365,7 @@ async fn passkey_start(
     Ok(Json(PasskeyStartResponse {
         challenge_id: id.to_string(),
         challenge,
+        rp_id: state.rp.id.clone(),
     }))
 }
 
@@ -368,6 +375,9 @@ struct PasskeyFinish {
     workspace_id: Uuid,
     credential_id: String,
     challenge_id: String,
+    /// WebAuthn assertion fields, base64url (navigator.credentials.get).
+    client_data_json: String,
+    authenticator_data: String,
     signature: String,
 }
 
@@ -381,10 +391,109 @@ async fn passkey_finish(
             "organization_id": body.organization_id.to_string(),
             "credential_id": body.credential_id,
             "challenge_id": body.challenge_id,
+            "client_data_json": body.client_data_json,
+            "authenticator_data": body.authenticator_data,
             "signature": body.signature,
         }),
     };
     finish_login(&state, &credential, body.organization_id, body.workspace_id).await
+}
+
+#[derive(Debug, Serialize)]
+struct RegisterStartResponse {
+    challenge_id: Uuid,
+    challenge: String,
+    rp_id: String,
+    user_id: String,
+}
+
+/// Begin registering a NEW passkey for the signed-in actor (WebAuthn
+/// `navigator.credentials.create`). Requires a live session: a passkey
+/// is only ever added by someone already authenticated.
+async fn passkey_register_start(
+    State(state): State<SharedState>,
+    ctx: RequestContext,
+) -> Result<Json<RegisterStartResponse>, StatusCode> {
+    let (id, challenge) = state
+        .sessions
+        .mint_registration_challenge(ctx.0.organization_id, ctx.0.actor_id)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(RegisterStartResponse {
+        challenge_id: id,
+        challenge: tinker_auth::passkey::b64url(&challenge),
+        rp_id: state.rp.id.clone(),
+        user_id: tinker_auth::passkey::b64url(ctx.0.actor_id.as_bytes()),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterFinish {
+    challenge_id: Uuid,
+    client_data_json: String,
+    attestation_object: String,
+}
+
+/// Finish registration: the challenge must be live and bound to this
+/// session's actor; it is consumed before verification (no grinding
+/// oracle), then the attestation is verified against this RP + origin.
+async fn passkey_register_finish(
+    State(state): State<SharedState>,
+    ctx: RequestContext,
+    Json(body): Json<RegisterFinish>,
+) -> Response {
+    use tinker_auth::PasskeyStore;
+    let org = ctx.0.organization_id;
+    let store = tinker_identity::PgPasskeyStore::new(state.core.0.clone());
+    let challenge = match store.find_challenge(org, body.challenge_id).await {
+        Ok(Some(c)) if !c.dead && c.actor_id == Some(ctx.0.actor_id) => c,
+        _ => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    if !matches!(
+        store.consume_challenge(org, body.challenge_id).await,
+        Ok(true)
+    ) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let decode = tinker_auth::webauthn::b64url_decode;
+    let (Ok(cd), Ok(att)) = (
+        decode(&body.client_data_json),
+        decode(&body.attestation_object),
+    ) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let reg = match tinker_auth::webauthn::verify_registration(
+        &state.rp,
+        &challenge.challenge,
+        &cd,
+        &att,
+    ) {
+        Ok(r) => r,
+        Err(_) => return StatusCode::UNAUTHORIZED.into_response(),
+    };
+    let credential_id = tinker_auth::passkey::b64url(&reg.credential_id);
+    match state
+        .sessions
+        .enroll_webauthn(
+            org,
+            ctx.0.actor_id,
+            &credential_id,
+            &reg.key,
+            reg.sign_count,
+        )
+        .await
+    {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "credential_id": credential_id,
+                "algorithm": reg.key.alg(),
+                "user_verified": reg.user_verified,
+            })),
+        )
+            .into_response(),
+        Err(_) => StatusCode::CONFLICT.into_response(),
+    }
 }
 
 async fn finish_login(
@@ -531,6 +640,7 @@ pub fn build_state_with_pii(
     cookie_secure: bool,
     pii: Option<tinker_ontology::sensitive::PiiSealer>,
 ) -> SharedState {
+    let host_for_rp = host_name.clone();
     let core = tinker_db::CoreDb(tenant_pool.clone());
     let owner = tinker_db::OwnerDb(system_pool.clone());
     let signals = SignalBus::new();
@@ -575,5 +685,6 @@ pub fn build_state_with_pii(
         comms: tinker_comms::Comms::new(core, ontology, signals),
         owner: tinker_db::OwnerDb(system_pool),
         pii,
+        rp: tinker_auth::webauthn::RelyingParty::from_env(&host_for_rp),
     })
 }

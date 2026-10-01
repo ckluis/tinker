@@ -181,3 +181,84 @@ customElements.define('rt-stat', RtStat);
 customElements.define('rt-select', RtSelect);
 customElements.define('rt-grid', RtGrid);
 customElements.define('rt-form', RtForm);
+
+/* Sign-in (login page). Passkey: the WebAuthn assertion ceremony
+ * (navigator.credentials.get) against a single-use server challenge.
+ * SSO: the OIDC authorization-code flow (server-side PKCE + nonce).
+ * The server decides everything; this only carries the ceremony.
+ */
+const b64url = {
+  decode(s) {
+    const b = atob(s.replace(/-/g, '+').replace(/_/g, '/').padEnd(Math.ceil(s.length / 4) * 4, '='));
+    return Uint8Array.from(b, (c) => c.charCodeAt(0));
+  },
+  encode(buf) {
+    const bytes = new Uint8Array(buf);
+    let s = '';
+    for (const b of bytes) s += String.fromCharCode(b);
+    return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  },
+};
+
+function loginError(form, message) {
+  let out = form.querySelector('.login-error');
+  if (!out) {
+    out = document.createElement('p');
+    out.className = 'login-error';
+    out.setAttribute('role', 'alert');
+    form.append(out);
+  }
+  out.textContent = message;
+}
+
+document.getElementById('passkey-form')?.addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const form = ev.currentTarget;
+  const f = Object.fromEntries(new FormData(form));
+  if (!window.PublicKeyCredential) {
+    loginError(form, 'This browser does not support passkeys.');
+    return;
+  }
+  try {
+    const start = await fetch('/login/passkey/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ organization_id: f.organization_id, actor_id: f.actor_id }),
+    }).then((r) => (r.ok ? r.json() : Promise.reject(new Error('start'))));
+    const cred = await navigator.credentials.get({
+      publicKey: {
+        challenge: b64url.decode(start.challenge),
+        rpId: start.rp_id,
+        userVerification: 'preferred',
+        timeout: 60000,
+      },
+    });
+    const res = await fetch('/login/passkey/finish', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        organization_id: f.organization_id,
+        workspace_id: f.workspace_id,
+        challenge_id: start.challenge_id,
+        credential_id: b64url.encode(cred.rawId),
+        client_data_json: b64url.encode(cred.response.clientDataJSON),
+        authenticator_data: b64url.encode(cred.response.authenticatorData),
+        signature: b64url.encode(cred.response.signature),
+      }),
+    });
+    if (res.redirected || res.ok) {
+      window.location.assign(res.url || '/apps');
+    } else {
+      loginError(form, 'Sign-in failed.');
+    }
+  } catch {
+    loginError(form, 'Sign-in failed or was cancelled.');
+  }
+});
+
+document.getElementById('oidc-form')?.addEventListener('submit', (ev) => {
+  ev.preventDefault();
+  const f = Object.fromEntries(new FormData(ev.currentTarget));
+  const q = new URLSearchParams({ organization_id: f.organization_id, workspace_id: f.workspace_id });
+  window.location.assign(`/login/oidc/start?${q}`);
+});

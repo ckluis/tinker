@@ -90,7 +90,8 @@ impl tinker_auth::PasskeyStore for PgPasskeyStore {
         let mut tx =
             tenant_tx(&self.tenant, organization_id, Uuid::nil(), "passkey.lookup").await?;
         let row = sqlx::query!(
-            r#"SELECT actor_id, public_key, revoked_at IS NOT NULL AS "revoked!"
+            r#"SELECT actor_id, public_key, cose_alg, sign_count,
+                      revoked_at IS NOT NULL AS "revoked!"
                FROM auth_credentials
                WHERE method = 'passkey' AND credential_id = $1"#,
             credential_id
@@ -101,11 +102,18 @@ impl tinker_auth::PasskeyStore for PgPasskeyStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        let public_key: [u8; 32] = row
-            .public_key
-            .ok_or_else(|| TinkerError::Validation("passkey credential has no public key".into()))?
-            .try_into()
-            .map_err(|_| TinkerError::Validation("passkey public key wrong length".into()))?;
+        let bytes = row.public_key.ok_or_else(|| {
+            TinkerError::Validation("passkey credential has no public key".into())
+        })?;
+        // cose_alg NULL: a legacy enrollment storing the raw Ed25519 key.
+        let key = match row.cose_alg {
+            None => {
+                tinker_auth::webauthn::CoseKey::Ed25519(bytes.try_into().map_err(|_| {
+                    TinkerError::Validation("passkey public key wrong length".into())
+                })?)
+            }
+            Some(_) => tinker_auth::webauthn::CoseKey::from_cose(&bytes)?,
+        };
         let orgs = sqlx::query!(
             "SELECT organization_id FROM memberships WHERE actor_id = $1",
             row.actor_id
@@ -117,7 +125,8 @@ impl tinker_auth::PasskeyStore for PgPasskeyStore {
         Ok(Some(tinker_auth::StoredPasskey {
             actor_id: row.actor_id,
             organization_ids: orgs.into_iter().map(|r| r.organization_id).collect(),
-            public_key,
+            key,
+            sign_count: u32::try_from(row.sign_count).unwrap_or(u32::MAX),
             revoked: row.revoked,
         }))
     }
@@ -144,6 +153,32 @@ impl tinker_auth::PasskeyStore for PgPasskeyStore {
             challenge: r.challenge,
             dead: r.dead,
         }))
+    }
+
+    async fn update_sign_count(
+        &self,
+        organization_id: Uuid,
+        credential_id: &str,
+        sign_count: u32,
+    ) -> Result<()> {
+        let mut tx = tenant_tx(
+            &self.tenant,
+            organization_id,
+            Uuid::nil(),
+            "passkey.counter",
+        )
+        .await?;
+        sqlx::query!(
+            r#"UPDATE auth_credentials SET sign_count = $2
+               WHERE method = 'passkey' AND credential_id = $1"#,
+            credential_id,
+            i64::from(sign_count),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        tx.commit().await.map_err(TinkerError::Db)?;
+        Ok(())
     }
 
     async fn consume_challenge(&self, organization_id: Uuid, challenge_id: Uuid) -> Result<bool> {
@@ -469,6 +504,66 @@ impl SessionManager {
         .map_err(TinkerError::Db)?;
         tx.commit().await.map_err(TinkerError::Db)?;
         Ok(())
+    }
+
+    /// Enroll a verified WebAuthn credential (from
+    /// `tinker_auth::webauthn::verify_registration`) for an actor.
+    pub async fn enroll_webauthn(
+        &self,
+        organization_id: Uuid,
+        actor_id: Uuid,
+        credential_id: &str,
+        key: &tinker_auth::webauthn::CoseKey,
+        sign_count: u32,
+    ) -> Result<()> {
+        let mut tx = tenant_tx(&self.tenant, organization_id, actor_id, "passkey.enroll").await?;
+        sqlx::query!(
+            r#"INSERT INTO auth_credentials
+               (organization_id, actor_id, method, credential_id, public_key, cose_alg, sign_count)
+               VALUES ($1, $2, 'passkey', $3, $4, $5, $6)"#,
+            organization_id,
+            actor_id,
+            credential_id,
+            key.to_cose(),
+            key.alg() as i32,
+            i64::from(sign_count),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("23505") => {
+                TinkerError::Validation("passkey credential already enrolled".into())
+            }
+            _ => TinkerError::Db(e),
+        })?;
+        tx.commit().await.map_err(TinkerError::Db)?;
+        Ok(())
+    }
+
+    /// Challenge for registering a NEW passkey, minted for an actor that
+    /// is already signed in (the caller holds a live session for them).
+    /// Bound to the actor; same TTL and live cap as login challenges.
+    pub async fn mint_registration_challenge(
+        &self,
+        organization_id: Uuid,
+        actor_id: Uuid,
+    ) -> Result<(Uuid, Vec<u8>)> {
+        let bytes = tinker_auth::fresh_challenge_bytes();
+        let mut tx = tenant_tx(&self.tenant, organization_id, actor_id, "passkey.register").await?;
+        let row = sqlx::query!(
+            r#"INSERT INTO auth_challenges
+               (organization_id, actor_id, challenge, expires_at)
+               VALUES ($1, $2, $3, now() + INTERVAL '5 minutes')
+               RETURNING id"#,
+            organization_id,
+            actor_id,
+            bytes.to_vec(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        tx.commit().await.map_err(TinkerError::Db)?;
+        Ok((row.id, bytes.to_vec()))
     }
 
     /// Bind an OIDC (issuer, subject) to an actor.

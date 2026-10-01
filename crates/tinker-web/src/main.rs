@@ -68,8 +68,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // The broker is assembled here, once, from configuration. Everything
     // downstream (sessions, grants, rendering) only sees AuthnContext.
+    // WebAuthn relying party: TINKER_WEBAUTHN_RP_ID / TINKER_WEBAUTHN_ORIGINS,
+    // defaulting to the host name and https://<host>.
+    let rp = tinker_auth::webauthn::RelyingParty::from_env(&host_name);
     let mut adapters: Vec<Box<dyn tinker_auth::AuthAdapter>> = vec![Box::new(PasskeyAdapter::new(
         PgPasskeyStore::new(tenant_pool.clone()),
+        rp,
     ))];
     if let (Ok(issuer), Ok(audience), Ok(pem_path)) = (
         std::env::var("OIDC_ISSUER"),

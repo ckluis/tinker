@@ -2627,7 +2627,7 @@ async fn run_lead(
             &env.ctx,
             &env.salesforce,
             l.stream_id,
-            &[l.target.clone()],
+            std::slice::from_ref(&l.target),
             2,
             mode,
         )
@@ -2670,13 +2670,11 @@ async fn lead_copies(env: &IngestEnv, l: &LeadStream) -> Vec<String> {
     out
 }
 
-fn sealer_env() -> impl std::future::Future<Output = tinker_ontology::sensitive::PiiSealer> {
-    async {
-        tinker_ontology::sensitive::sealer_from_env()
-            .await
-            .unwrap()
-            .expect("TINKER_PII_URL, TINKER_KEK, TINKER_BLIND_INDEX_KEY must be set")
-    }
+async fn sealer_env() -> tinker_ontology::sensitive::PiiSealer {
+    tinker_ontology::sensitive::sealer_from_env()
+        .await
+        .unwrap()
+        .expect("TINKER_PII_URL, TINKER_KEK, TINKER_BLIND_INDEX_KEY must be set")
 }
 
 /// Sensitive canonical fields (docs/pii-sensitive-fields.md) through

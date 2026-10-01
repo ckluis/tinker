@@ -8,6 +8,7 @@
 pub mod apikey;
 pub mod oidc;
 pub mod passkey;
+pub mod webauthn;
 
 pub use apikey::{
     scope_allows, validate_scope, ApiKeyAdapter, IssuedCredential, MachineCredential,

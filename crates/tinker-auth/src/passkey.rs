@@ -1,25 +1,24 @@
-//! Local passkey adapter.
+//! WebAuthn passkey adapter.
 //!
-//! A passkey here is an Ed25519 key pair whose public half is enrolled
-//! against an actor. Authentication is a challenge-response ceremony:
+//! A passkey is a WebAuthn credential (ES256 or EdDSA COSE key) enrolled
+//! against an actor. Login is the WebAuthn assertion ceremony:
 //!
 //! 1. The server mints a single-use, short-lived random challenge.
-//! 2. The authenticator signs the challenge bytes with the private key.
-//! 3. This adapter verifies the signature against the enrolled public key
-//!    and atomically consumes the challenge.
+//! 2. The browser runs `navigator.credentials.get`; the authenticator
+//!    signs `authenticatorData ‖ SHA-256(clientDataJSON)`.
+//! 3. This adapter consumes the challenge, then verifies the assertion
+//!    (type, challenge, origin, RP ID hash, user presence, counter,
+//!    signature — see [`crate::webauthn`]) and records the new counter.
 //!
-//! The browser WebAuthn ceremony (navigator.credentials) is intentionally
-//! out of scope for M1: the cryptography verified here — proof of
-//! possession of the enrolled private key over a fresh server challenge —
-//! is the security substance. A WebAuthn transport can replace the
-//! signature carrier later without touching this verification logic or any
-//! authorization code.
+//! Assurance is `MultiFactor` only when the authenticator reports user
+//! verification (biometric / PIN); presence alone is `SingleFactor`.
 
 use async_trait::async_trait;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use uuid::Uuid;
+
+use crate::webauthn::{verify_assertion, CoseKey, RelyingParty};
 
 use tinker_core::{Result, TinkerError};
 
@@ -31,7 +30,9 @@ pub struct StoredPasskey {
     pub actor_id: Uuid,
     /// Organizations the identity may act in (membership).
     pub organization_ids: Vec<Uuid>,
-    pub public_key: [u8; 32],
+    pub key: CoseKey,
+    /// Last signature counter seen (0 when the authenticator keeps none).
+    pub sign_count: u32,
     pub revoked: bool,
 }
 
@@ -62,25 +63,33 @@ pub trait PasskeyStore: Send + Sync {
     /// Atomically consume a live challenge. Returns false when the
     /// challenge is unknown, expired, or already consumed.
     async fn consume_challenge(&self, organization_id: Uuid, challenge_id: Uuid) -> Result<bool>;
+    /// Record the counter of a verified assertion.
+    async fn update_sign_count(
+        &self,
+        organization_id: Uuid,
+        credential_id: &str,
+        sign_count: u32,
+    ) -> Result<()>;
 }
 
 pub struct PasskeyAdapter<S: PasskeyStore> {
     store: S,
+    rp: RelyingParty,
 }
 
 impl<S: PasskeyStore> PasskeyAdapter<S> {
-    pub fn new(store: S) -> Self {
-        Self { store }
+    pub fn new(store: S, rp: RelyingParty) -> Self {
+        Self { store, rp }
     }
 }
 
-fn b64_to_64(s: &str) -> Result<[u8; 64]> {
-    let bytes = URL_SAFE_NO_PAD
-        .decode(s)
-        .map_err(|_| TinkerError::Validation("passkey: bad base64".into()))?;
-    bytes
-        .try_into()
-        .map_err(|_| TinkerError::Validation("passkey: expected 64 bytes".into()))
+fn field(credential: &Credential, name: &str) -> Result<Vec<u8>> {
+    credential
+        .payload
+        .get(name)
+        .and_then(|v| v.as_str())
+        .map(crate::webauthn::b64url_decode)
+        .ok_or_else(|| TinkerError::Validation(format!("passkey: missing {name}")))?
 }
 
 #[async_trait]
@@ -111,12 +120,9 @@ impl<S: PasskeyStore> AuthAdapter for PasskeyAdapter<S> {
             .and_then(|v| v.as_str())
             .and_then(|s| Uuid::parse_str(s).ok())
             .ok_or_else(|| TinkerError::Validation("passkey: missing challenge_id".into()))?;
-        let signature = credential
-            .payload
-            .get("signature")
-            .and_then(|v| v.as_str())
-            .map(b64_to_64)
-            .ok_or_else(|| TinkerError::Validation("passkey: missing signature".into()))??;
+        let client_data_json = field(credential, "client_data_json")?;
+        let authenticator_data = field(credential, "authenticator_data")?;
+        let signature = field(credential, "signature")?;
 
         let stored = self
             .store
@@ -152,18 +158,31 @@ impl<S: PasskeyStore> AuthAdapter for PasskeyAdapter<S> {
             ));
         }
 
-        let verifying = VerifyingKey::from_bytes(&stored.public_key)
-            .map_err(|_| TinkerError::Validation("passkey: bad enrolled public key".into()))?;
-        verifying
-            .verify(&challenge.challenge, &Signature::from_bytes(&signature))
-            .map_err(|_| TinkerError::Forbidden("passkey: bad signature".into()))?;
+        let assertion = verify_assertion(
+            &self.rp,
+            &stored.key,
+            stored.sign_count,
+            &challenge.challenge,
+            &client_data_json,
+            &authenticator_data,
+            &signature,
+        )?;
+        self.store
+            .update_sign_count(org_id, credential_id, assertion.sign_count)
+            .await?;
 
         Ok(AuthnContext {
             actor_id: stored.actor_id,
             principal_kind: PrincipalKind::Human,
             organization_ids: stored.organization_ids,
             method: self.method().to_string(),
-            assurance: AssuranceLevel::MultiFactor,
+            // Possession of the key is one factor; the authenticator's
+            // own user verification (biometric / PIN) is the second.
+            assurance: if assertion.user_verified {
+                AssuranceLevel::MultiFactor
+            } else {
+                AssuranceLevel::SingleFactor
+            },
             authenticated_at: Utc::now(),
             credential_id: credential_id.to_string(),
         })
@@ -202,6 +221,12 @@ mod tests {
         async fn find_challenge(&self, _org: Uuid, id: Uuid) -> Result<Option<StoredChallenge>> {
             Ok(self.challenges.lock().unwrap().get(&id).cloned())
         }
+        async fn update_sign_count(&self, _org: Uuid, id: &str, n: u32) -> Result<()> {
+            if let Some(c) = self.creds.lock().unwrap().get_mut(id) {
+                c.sign_count = n;
+            }
+            Ok(())
+        }
         async fn consume_challenge(&self, _org: Uuid, id: Uuid) -> Result<bool> {
             let mut map = self.challenges.lock().unwrap();
             match map.get_mut(&id) {
@@ -228,13 +253,14 @@ mod tests {
                 StoredPasskey {
                     actor_id: actor,
                     organization_ids: vec![org],
-                    public_key: signing.verifying_key().to_bytes(),
+                    key: CoseKey::Ed25519(signing.verifying_key().to_bytes()),
+                    sign_count: 0,
                     revoked: false,
                 },
             )])),
             challenges: Mutex::new(HashMap::new()),
         };
-        (PasskeyAdapter::new(store), org, actor, cred_id)
+        (PasskeyAdapter::new(store, rp()), org, actor, cred_id)
     }
 
     fn mint(store: &MemStore, bound: Option<Uuid>) -> (Uuid, [u8; 32]) {
@@ -251,16 +277,49 @@ mod tests {
         (id, bytes)
     }
 
-    fn credential(org: Uuid, cred_id: &str, challenge_id: Uuid, sig: &[u8; 64]) -> Credential {
+    fn rp() -> RelyingParty {
+        RelyingParty {
+            id: "tinker.test".into(),
+            origins: vec!["https://tinker.test".into()],
+        }
+    }
+
+    /// A user-verified assertion over `challenge` from a soft authenticator.
+    fn sign(sk: &SigningKey, challenge: &[u8]) -> (String, String, String) {
+        crate::webauthn::soft_authenticator::ed25519_assertion(sk, &rp(), challenge, 0, true)
+    }
+
+    fn credential(
+        org: Uuid,
+        cred_id: &str,
+        challenge_id: Uuid,
+        a: &(String, String, String),
+    ) -> Credential {
         Credential {
             kind: CredentialKind::WebAuthn,
             payload: serde_json::json!({
                 "organization_id": org.to_string(),
                 "credential_id": cred_id,
                 "challenge_id": challenge_id.to_string(),
-                "signature": b64url(sig),
+                "client_data_json": a.0,
+                "authenticator_data": a.1,
+                "signature": a.2,
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn presence_without_verification_is_single_factor() {
+        let sk = signing();
+        let (adapter, org, actor, cred_id) = adapter_with(&sk);
+        let (cid, bytes) = mint(&adapter.store, Some(actor));
+        let a =
+            crate::webauthn::soft_authenticator::ed25519_assertion(&sk, &rp(), &bytes, 0, false);
+        let ctx = adapter
+            .authenticate(&credential(org, &cred_id, cid, &a))
+            .await
+            .unwrap();
+        assert_eq!(ctx.assurance, AssuranceLevel::SingleFactor);
     }
 
     #[tokio::test]
@@ -268,8 +327,7 @@ mod tests {
         let sk = signing();
         let (adapter, org, actor, cred_id) = adapter_with(&sk);
         let (cid, bytes) = mint(&adapter.store, Some(actor));
-        use ed25519_dalek::Signer;
-        let sig = sk.sign(&bytes).to_bytes();
+        let sig = sign(&sk, &bytes);
         let ctx = adapter
             .authenticate(&credential(org, &cred_id, cid, &sig))
             .await
@@ -285,8 +343,7 @@ mod tests {
         let sk = signing();
         let (adapter, org, actor, cred_id) = adapter_with(&sk);
         let (cid, bytes) = mint(&adapter.store, Some(actor));
-        use ed25519_dalek::Signer;
-        let sig = sk.sign(&bytes).to_bytes();
+        let sig = sign(&sk, &bytes);
         adapter
             .authenticate(&credential(org, &cred_id, cid, &sig))
             .await
@@ -304,8 +361,7 @@ mod tests {
         let (adapter, org, actor, cred_id) = adapter_with(&sk);
         let (cid, bytes) = mint(&adapter.store, Some(actor));
         let wrong = SigningKey::from_bytes(&[9u8; 32]);
-        use ed25519_dalek::Signer;
-        let sig = wrong.sign(&bytes).to_bytes();
+        let sig = sign(&wrong, &bytes);
         let err = adapter
             .authenticate(&credential(org, &cred_id, cid, &sig))
             .await
@@ -326,8 +382,7 @@ mod tests {
             .unwrap()
             .revoked = true;
         let (cid, bytes) = mint(&adapter.store, Some(actor));
-        use ed25519_dalek::Signer;
-        let sig = sk.sign(&bytes).to_bytes();
+        let sig = sign(&sk, &bytes);
         let err = adapter
             .authenticate(&credential(org, &cred_id, cid, &sig))
             .await
