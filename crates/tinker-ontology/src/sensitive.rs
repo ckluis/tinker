@@ -345,6 +345,34 @@ impl PiiSealer {
         object_id: Uuid,
         api_name: &str,
     ) -> Result<RetrofitReport> {
+        // Every value sealed by this run, so a failure can destroy them:
+        // the vault write is not part of the core transaction, and an
+        // unreferenced ciphertext is still PII at rest.
+        let mut sealed: Vec<(Uuid, Uuid)> = Vec::new();
+        let result = self
+            .retrofit_inner(owner, object_id, api_name, &mut sealed)
+            .await;
+        if result.is_err() {
+            let mut by_org: std::collections::HashMap<Uuid, Vec<Uuid>> = Default::default();
+            for (org, id) in sealed {
+                by_org.entry(org).or_default().push(id);
+            }
+            for (org, ids) in by_org {
+                let ctx = retrofit_ctx(org);
+                // Best effort; `sweep_orphans` collects anything left.
+                let _ = self.vault.destroy_many(&ctx, &ids).await;
+            }
+        }
+        result
+    }
+
+    async fn retrofit_inner(
+        &self,
+        owner: &tinker_db::OwnerDb,
+        object_id: Uuid,
+        api_name: &str,
+        sealed: &mut Vec<(Uuid, Uuid)>,
+    ) -> Result<RetrofitReport> {
         let mut tx = owner.0.begin().await.map_err(TinkerError::Db)?;
         let field: Option<(Uuid, String, String, bool, serde_json::Value, String)> =
             sqlx::query_as(
@@ -402,55 +430,59 @@ impl PiiSealer {
         .execute(&mut *tx)
         .await
         .map_err(TinkerError::Db)?;
+        let class = format!("pii.{api_name}");
+        let f = RetrofitField {
+            id: field_id,
+            kind: &kind,
+            class: &class,
+        };
+
+        // 1. Live rows, keyset-paged and sealed in bulk per chunk.
+        let mut rows = 0usize;
+        let mut after: (Uuid, Uuid) = (Uuid::nil(), Uuid::nil());
+        loop {
+            let page: Vec<(Uuid, Uuid, String)> = sqlx::query_as(&format!(
+                "SELECT organization_id, id, \"{old_col}\" FROM {table} \
+                 WHERE \"{old_col}\" IS NOT NULL AND (organization_id, id) > ($1, $2) \
+                 ORDER BY organization_id, id LIMIT {RETROFIT_CHUNK}"
+            ))
+            .bind(after.0)
+            .bind(after.1)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(TinkerError::Db)?;
+            let Some(last) = page.last() else { break };
+            after = (last.0, last.1);
+            rows += page.len();
+            let (mut orgs, mut ids, mut refs, mut bidxs) = (vec![], vec![], vec![], vec![]);
+            for (org, items) in group_by_org(page.into_iter().map(|(o, i, v)| (o, (i, v)))) {
+                let sealed_chunk = self.seal_chunk(&mut tx, org, &f, &items, sealed).await?;
+                for ((id, _), (r, b)) in items.iter().zip(sealed_chunk) {
+                    orgs.push(org);
+                    ids.push(*id);
+                    refs.push(r);
+                    bidxs.push(b);
+                }
+            }
+            sqlx::query(&format!(
+                "UPDATE {table} t SET \"{new_col}\" = v.r, \"{bidx_col}\" = v.b \
+                 FROM unnest($1::uuid[], $2::uuid[], $3::uuid[], $4::text[]) AS v(o, i, r, b) \
+                 WHERE t.organization_id = v.o AND t.id = v.i"
+            ))
+            .bind(&orgs)
+            .bind(&ids)
+            .bind(&refs)
+            .bind(&bidxs)
+            .execute(&mut *tx)
+            .await
+            .map_err(TinkerError::Db)?;
+        }
         sqlx::query(&format!(
             "CREATE INDEX \"{bidx_col}_idx\" ON {table} (organization_id, \"{bidx_col}\")"
         ))
         .execute(&mut *tx)
         .await
         .map_err(TinkerError::Db)?;
-
-        let class = format!("pii.{api_name}");
-        let ctx_for = |org: Uuid| {
-            TenantContext::new(
-                tinker_core::OrganizationId(org),
-                Uuid::nil(),
-                "pii.retrofit",
-            )
-        };
-        // 1. Live rows.
-        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(&format!(
-            "SELECT organization_id, id, \"{old_col}\" FROM {table} WHERE \"{old_col}\" IS NOT NULL"
-        ))
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(TinkerError::Db)?;
-        for (org, id, value) in &rows {
-            let ctx = ctx_for(*org);
-            let (ref_id, bidx) = self
-                .seal_one(&ctx, field_id, &kind, *id, &class, value)
-                .await?;
-            register_refs(
-                &mut tx,
-                &ctx,
-                &[SealedRef {
-                    ref_id,
-                    subject: *id,
-                    storage_class: class.clone(),
-                }],
-            )
-            .await?;
-            sqlx::query(&format!(
-                "UPDATE {table} SET \"{new_col}\" = $3, \"{bidx_col}\" = $4 \
-                 WHERE organization_id = $1 AND id = $2"
-            ))
-            .bind(org)
-            .bind(id)
-            .bind(ref_id)
-            .bind(&bidx)
-            .execute(&mut *tx)
-            .await
-            .map_err(TinkerError::Db)?;
-        }
 
         // 2. Plaintext copies in history, for the object and its adopters.
         let mut copies = 0usize;
@@ -483,33 +515,38 @@ impl PiiSealer {
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(TinkerError::Db)?;
-                for (org, key_val, subject, value) in hits {
-                    let ctx = ctx_for(org);
-                    let (ref_id, bidx) = self
-                        .seal_one(&ctx, field_id, &kind, subject, &class, &value)
-                        .await?;
-                    register_refs(
-                        &mut tx,
-                        &ctx,
-                        &[SealedRef {
-                            ref_id,
-                            subject,
-                            storage_class: class.clone(),
-                        }],
-                    )
-                    .await?;
+                copies += hits.len();
+                for chunk in hits.chunks(RETROFIT_CHUNK) {
+                    let (mut orgs, mut keys, mut refs, mut bidxs) =
+                        (vec![], vec![], vec![], vec![]);
+                    for (org, items) in
+                        group_by_org(chunk.iter().map(|(o, k, subj, v)| (*o, (k, *subj, v))))
+                    {
+                        let values: Vec<(Uuid, String)> =
+                            items.iter().map(|(_, s, v)| (*s, (*v).clone())).collect();
+                        let sealed_chunk =
+                            self.seal_chunk(&mut tx, org, &f, &values, sealed).await?;
+                        for ((k, _, _), (r, b)) in items.into_iter().zip(sealed_chunk) {
+                            orgs.push(org);
+                            keys.push(k.clone());
+                            refs.push(r);
+                            bidxs.push(b);
+                        }
+                    }
                     sqlx::query(&format!(
-                        "UPDATE {table_name} SET {col} = jsonb_set({col}, ARRAY[$3], $4) \
-                         WHERE organization_id = $1 AND {key} = $2"
+                        "UPDATE {table_name} SET {col} = jsonb_set({col}, ARRAY[$1], \
+                             jsonb_build_object('pii_ref', v.r::text, 'bidx', v.b)) \
+                         FROM unnest($2::uuid[], $3::text[], $4::uuid[], $5::text[]) AS v(o, k, r, b) \
+                         WHERE organization_id = v.o AND {key} = v.k"
                     ))
-                    .bind(org)
-                    .bind(&key_val)
                     .bind(api_name)
-                    .bind(sealed_json(ref_id, &bidx))
+                    .bind(&orgs)
+                    .bind(&keys)
+                    .bind(&refs)
+                    .bind(&bidxs)
                     .execute(&mut *tx)
                     .await
                     .map_err(TinkerError::Db)?;
-                    copies += 1;
                 }
             }
         }
@@ -540,7 +577,7 @@ impl PiiSealer {
             "api_name": api_name,
             "old_physical_column": old_col,
             "physical_column": new_col,
-            "rows": rows.len(),
+            "rows": rows,
             "history_copies": copies,
         }))
         .bind(vec![drop.clone()])
@@ -549,28 +586,189 @@ impl PiiSealer {
         .map_err(TinkerError::Db)?;
         tx.commit().await.map_err(TinkerError::Db)?;
         Ok(RetrofitReport {
-            rows: rows.len(),
+            rows,
             history_copies: copies,
             old_column: old_col,
             new_column: new_col,
         })
     }
 
-    async fn seal_one(
+    /// Seal one organization's `(subject, plaintext)` items in bulk and
+    /// register their active `pii_refs` in `tx`. Returns `(ref, bidx)`
+    /// per item, in order; records sealed ids for failure cleanup.
+    async fn seal_chunk(
         &self,
-        ctx: &TenantContext,
-        field_id: Uuid,
-        kind: &str,
-        subject: Uuid,
-        class: &str,
-        value: &str,
-    ) -> Result<(Uuid, String)> {
-        let bidx = self
-            .bidx
-            .digest(ctx.organization_id.0, field_id, kind, value);
-        let ref_id = self.vault.seal(ctx, subject, class, value).await?;
-        Ok((ref_id, bidx))
+        tx: &mut Transaction<'_, Postgres>,
+        org: Uuid,
+        f: &RetrofitField<'_>,
+        items: &[(Uuid, String)],
+        sealed: &mut Vec<(Uuid, Uuid)>,
+    ) -> Result<Vec<(Uuid, String)>> {
+        let ctx = retrofit_ctx(org);
+        let batch: Vec<(Uuid, String, String)> = items
+            .iter()
+            .map(|(subject, v)| (*subject, f.class.to_string(), v.clone()))
+            .collect();
+        let ids = self.vault.seal_batch(&ctx, &batch).await?;
+        sealed.extend(ids.iter().map(|i| (org, *i)));
+        let subjects: Vec<Uuid> = items.iter().map(|(s, _)| *s).collect();
+        sqlx::query(
+            "INSERT INTO pii_refs (id, organization_id, subject_id, storage_class, state) \
+             SELECT i, $2, s, $4, 'active' FROM unnest($1::uuid[], $3::uuid[]) AS v(i, s)",
+        )
+        .bind(&ids)
+        .bind(org)
+        .bind(&subjects)
+        .bind(f.class)
+        .execute(&mut **tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        Ok(ids
+            .into_iter()
+            .zip(items)
+            .map(|(r, (_, v))| (r, self.bidx.digest(org, f.id, f.kind, v)))
+            .collect())
     }
+}
+
+/// Column writes for one sealed value: the vault-ref column and its
+/// blind-index column, as returned by [`PiiSealer::seal_for_write`].
+#[derive(Debug, Clone)]
+pub struct SealedColumns {
+    pub ref_column: String,
+    pub ref_id: Uuid,
+    pub bidx_column: String,
+    pub bidx: String,
+}
+
+impl PiiSealer {
+    /// Seal one value of `object_id.api_name` for `org` outside the
+    /// governed write path — fixtures and bulk loaders that write rows
+    /// with SQL. Registers the active `pii_refs` row (owner pool) and
+    /// returns the two columns to write. Writing the plaintext instead
+    /// fails on the UUID column, by design.
+    pub async fn seal_for_write(
+        &self,
+        owner_pool: &sqlx::PgPool,
+        org: Uuid,
+        object_id: Uuid,
+        api_name: &str,
+        value: &str,
+    ) -> Result<SealedColumns> {
+        let (field_id, physical, kind, sensitive): (Uuid, String, String, bool) = sqlx::query_as(
+            "SELECT id, physical_column, field_type, sensitive FROM ontology_fields \
+             WHERE object_id = $1 AND api_name = $2 AND state = 'active'",
+        )
+        .bind(object_id)
+        .bind(api_name)
+        .fetch_optional(owner_pool)
+        .await
+        .map_err(TinkerError::Db)?
+        .ok_or_else(|| TinkerError::NotFound(format!("field {api_name}")))?;
+        if !sensitive {
+            return Err(TinkerError::Validation(format!(
+                "field '{api_name}' is not sensitive; write the value directly"
+            )));
+        }
+        let ctx = retrofit_ctx(org);
+        let class = format!("pii.{api_name}");
+        let subject = Uuid::now_v7();
+        let ref_id = self.vault.seal(&ctx, subject, &class, value).await?;
+        sqlx::query(
+            "INSERT INTO pii_refs (id, organization_id, subject_id, storage_class, state) \
+             VALUES ($1, $2, $3, $4, 'active')",
+        )
+        .bind(ref_id)
+        .bind(org)
+        .bind(subject)
+        .bind(&class)
+        .execute(owner_pool)
+        .await
+        .map_err(TinkerError::Db)?;
+        Ok(SealedColumns {
+            bidx_column: crate::bidx_column(&physical),
+            bidx: self.bidx.digest(org, field_id, &kind, value),
+            ref_column: physical,
+            ref_id,
+        })
+    }
+}
+
+/// Rows per bulk seal / update during a retrofit.
+const RETROFIT_CHUNK: usize = 2000;
+
+struct RetrofitField<'a> {
+    id: Uuid,
+    kind: &'a str,
+    class: &'a str,
+}
+
+fn retrofit_ctx(org: Uuid) -> TenantContext {
+    TenantContext::new(
+        tinker_core::OrganizationId(org),
+        Uuid::nil(),
+        "pii.retrofit",
+    )
+}
+
+/// `(org, item)` → per-org item lists, in first-seen org order (inputs
+/// arrive org-sorted, so each org's run stays contiguous).
+fn group_by_org<T>(items: impl Iterator<Item = (Uuid, T)>) -> Vec<(Uuid, Vec<T>)> {
+    let mut out: Vec<(Uuid, Vec<T>)> = Vec::new();
+    for (org, item) in items {
+        match out.last_mut() {
+            Some((o, list)) if *o == org => list.push(item),
+            _ => out.push((org, vec![item])),
+        }
+    }
+    out
+}
+
+/// Delete vault ciphertext that no core `pii_refs` row references and
+/// that is older than `grace` (in-flight two-phase writes take seconds).
+/// Such values exist when a core transaction rolled back after the vault
+/// write — they can never be revealed, but they are still PII at rest
+/// and erasure cannot reach them. Owner pools on both databases.
+pub async fn sweep_orphans(
+    core_owner: &sqlx::PgPool,
+    pii_owner: &sqlx::PgPool,
+    grace: chrono::Duration,
+) -> Result<u64> {
+    let cutoff = chrono::Utc::now() - grace;
+    let mut after = Uuid::nil();
+    let mut removed = 0u64;
+    loop {
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM pii_values WHERE id > $1 AND created_at < $2 ORDER BY id LIMIT 5000",
+        )
+        .bind(after)
+        .bind(cutoff)
+        .fetch_all(pii_owner)
+        .await
+        .map_err(TinkerError::Db)?;
+        let Some(last) = ids.last() else { break };
+        after = *last;
+        let referenced: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM pii_refs WHERE id = ANY($1)")
+                .bind(&ids)
+                .fetch_all(core_owner)
+                .await
+                .map_err(TinkerError::Db)?;
+        let referenced: std::collections::HashSet<Uuid> = referenced.into_iter().collect();
+        let orphans: Vec<Uuid> = ids
+            .into_iter()
+            .filter(|i| !referenced.contains(i))
+            .collect();
+        if !orphans.is_empty() {
+            removed += sqlx::query("DELETE FROM pii_values WHERE id = ANY($1)")
+                .bind(&orphans)
+                .execute(pii_owner)
+                .await
+                .map_err(TinkerError::Db)?
+                .rows_affected();
+        }
+    }
+    Ok(removed)
 }
 
 /// Build the sealer from the environment for a server process.

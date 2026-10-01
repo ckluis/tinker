@@ -183,16 +183,31 @@ async fn insert_company(env: &AgentEnv, name: &str, industry: &str, size: &str) 
 
 async fn insert_contact(env: &AgentEnv, name: &str, email: &str, company_id: Uuid) -> Uuid {
     let c_name = phys(env, "crm_contact", "name").await;
-    let c_email = phys(env, "crm_contact", "email").await;
     let c_company = phys(env, "crm_contact", "company").await;
+    // Email is PII by type: the column holds a vault ref + blind index.
+    let contact_object: Uuid = sqlx::query_scalar(
+        "SELECT id FROM ontology_objects WHERE api_slug = 'crm_contact' AND scope_kind = 'platform'",
+    )
+    .fetch_one(&env.owner.0)
+    .await
+    .unwrap();
+    let sealed = tinker_ontology::sensitive::sealer_from_env()
+        .await
+        .unwrap()
+        .expect("TINKER_PII_URL, TINKER_KEK, TINKER_BLIND_INDEX_KEY must be set")
+        .seal_for_write(&env.owner.0, env.org_id, contact_object, "email", email)
+        .await
+        .unwrap();
     let mut tx = env.core.tenant_tx(&env.exec_ctx).await.unwrap();
     let (id,): (Uuid,) = sqlx::query_as(&format!(
-        "INSERT INTO data.crm_contact (organization_id, \"{c_name}\", \"{c_email}\", \"{c_company}\")
-         VALUES ($1, $2, $3, $4) RETURNING id"
+        "INSERT INTO data.crm_contact (organization_id, \"{c_name}\", \"{}\", \"{}\", \"{c_company}\")
+         VALUES ($1, $2, $3, $4, $5) RETURNING id",
+        sealed.ref_column, sealed.bidx_column
     ))
     .bind(env.org_id)
     .bind(name)
-    .bind(email)
+    .bind(sealed.ref_id)
+    .bind(&sealed.bidx)
     .bind(company_id)
     .fetch_one(&mut *tx)
     .await

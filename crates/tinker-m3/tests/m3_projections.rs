@@ -171,6 +171,14 @@ async fn hidden_fields_cannot_filter_or_sort() {
         StatusCode::FORBIDDEN,
         "sort on hidden field must be rejected"
     );
+    // Phone is PII by type: even a role that may see it cannot sort on
+    // it (ordering would leak the plaintext's order).
+    let (status, _) = post_query(&env.router, &env.org_a.sales, &sort_intent).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "sort on a PII field is refused"
+    );
 }
 
 /// A projection that hides everything still fails closed (not an empty

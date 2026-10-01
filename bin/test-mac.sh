@@ -48,4 +48,14 @@ STATUS=$?
 grep -E "^test result:" "$LOG" | awk '{p+=$4; f+=$6; i+=$8} END {printf "test-mac: passed %d failed %d ignored %d\n", p, f, i}'
 grep -E "^test .* FAILED$" "$LOG" | sed 's/^/test-mac: /'
 echo "test-mac: log $HERE/$LOG (exit $STATUS)"
+
+# The no-plaintext-PII gate (samen's `no_plaintext_pii` tier): every
+# email/phone field in the database the suite just exercised must be
+# vault-backed. A green suite that left plaintext PII behind still fails.
+if ! cargo run -q -p tinker-m7 --bin tinker-cli -- pii verify >>"$LOG" 2>&1; then
+  echo "test-mac: FAILED pii verify (plaintext email/phone fields; see log)"
+  STATUS=1
+else
+  echo "test-mac: pii verify ok"
+fi
 exit $STATUS

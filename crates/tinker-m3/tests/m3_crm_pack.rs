@@ -75,7 +75,7 @@ async fn pack_objects_create_real_tables() {
         let _ = cols;
     }
 
-    // Typed columns: email is citext, amount is numeric.
+    // Typed columns: email is a vault ref (PII by type), amount is numeric.
     let (email_type,): (String,) = sqlx::query_as(
         "SELECT data_type FROM information_schema.columns
          WHERE table_schema='data' AND table_name='crm_contact' AND column_name LIKE 'f_%'
@@ -85,9 +85,10 @@ async fn pack_objects_create_real_tables() {
     .fetch_one(&env.system_pool)
     .await
     .unwrap();
-    assert!(
-        email_type.contains("character") || email_type == "citext" || email_type == "text",
-        "email is a text-family type, got {email_type}"
+    // Email is PII by type: its column holds the vault ref, never text.
+    assert_eq!(
+        email_type, "uuid",
+        "email is a vault-ref column, got {email_type}"
     );
     let (amount_type,): (String,) = sqlx::query_as(
         "SELECT data_type FROM information_schema.columns

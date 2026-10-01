@@ -8,7 +8,7 @@ Status: ACCEPTED 2026-09-30. Decisions D1–D3 were made by the operator; the re
 ## Decisions
 | # | Decision | Choice |
 |---|---|---|
-| D1 | How a field becomes vault-backed | `sensitive: true` on a `text`, `email` or `phone` field. Set when the field is defined, and immutable afterwards |
+| D1 | How a field becomes vault-backed | **PII by type** (as in samen): every `email` and `phone` field is always sensitive, and the flag cannot turn it off. A `text` field opts in with `sensitive: true`. Fixed at definition; an existing field converts through Retrofit |
 | D2 | What normal reads return | A fixed mask (`"••••••"`) for a present value, `null` for an absent one. Plaintext comes only from the `reveal` tool, which requires a purpose, is role-gated and is audited per value |
 | D3 | Lookups | Exact match only, through a keyed blind index. No sorting, ranges, `contains` or `starts_with` on sensitive fields |
 | D4 | Physical storage | The field's column is `UUID` and holds the `pii_refs` id. A sibling `"<col>__bidx" TEXT` holds the blind index, with an index on `(organization_id, bidx)` |
@@ -34,6 +34,11 @@ Status: ACCEPTED 2026-09-30. Decisions D1–D3 were made by the operator; the re
 Refused: fields with a preset, fields driving a row filter, and fields that are already sensitive.
 
 **Erasure is not complete until** servers are restarted (cached plans name the old column), `VACUUM FULL` has rewritten the table, and backups taken before the retrofit have aged out. WAL and backups still hold the plaintext until then.
+
+## Gates and hygiene
+- `tinker-cli pii verify` is the no-plaintext-PII gate. It exits 1 if any email or phone field is not vault-backed, and `bin/test-mac.sh` runs it after the suite.
+- `tinker-cli pii retrofit` converts every field `verify` reports. It works in batches: rows are keyset-paged in chunks of 2,000, sealed with one vault call per chunk, then registered and updated in bulk. On the dev database, 1,019,943 rows plus 234,189 ingest copies took 92 seconds. If it fails, it destroys every vault value it sealed.
+- `tinker-cli pii sweep [--grace-minutes N]` deletes vault ciphertext that no `pii_refs` row references and that is older than the grace period (default 60 minutes). Such values are left behind when a core transaction rolls back after the vault write. They can never be revealed, but they are still PII at rest, and erasure cannot reach them. Run it on a schedule.
 
 ## Not in v1
 - Turning `sensitive` back off. That would be a disclosure; it is deliberately not offered.

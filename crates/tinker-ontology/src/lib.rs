@@ -119,6 +119,13 @@ impl FieldType {
         }
     }
 
+    /// PII by type (as in samen): an email address or phone number is
+    /// personal data wherever it appears, so these kinds are ALWAYS
+    /// vault-backed — `sensitive` cannot be switched off for them.
+    pub fn is_pii(&self) -> bool {
+        matches!(self, Self::Email | Self::Phone)
+    }
+
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::Text => "text",
@@ -170,6 +177,14 @@ pub struct FieldDef {
     /// and false is never serialized, so existing payloads are unchanged.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sensitive: bool,
+}
+
+impl FieldDef {
+    /// Whether this field is vault-backed: declared `sensitive`, or of a
+    /// PII type (email, phone), which is sensitive regardless of the flag.
+    pub fn effective_sensitive(&self) -> bool {
+        self.sensitive || self.field_type.is_pii()
+    }
 }
 
 /// Item 42 (C7): the permissive default — pre-item-42 field
@@ -338,7 +353,7 @@ pub fn validate_field_def(def: &FieldDef) -> Result<()> {
         let _ = opts;
     }
     validate_validation_rules(def)?;
-    if def.sensitive {
+    if def.effective_sensitive() {
         if !matches!(
             def.field_type,
             FieldType::Text | FieldType::Email | FieldType::Phone
@@ -1181,7 +1196,8 @@ impl Ontology {
         // writer that skips sealing fails on the column type, and a reader
         // that skips masking sees only an opaque id. The blind index sits
         // in a sibling column for exact-match lookups.
-        let alter = if def.sensitive {
+        let sensitive = def.effective_sensitive();
+        let alter = if sensitive {
             let bidx = bidx_column(&physical);
             format!(
                 "ALTER TABLE {table} ADD COLUMN \"{physical}\" UUID, ADD COLUMN \"{bidx}\" TEXT"
@@ -1193,7 +1209,7 @@ impl Ontology {
             )
         };
         sqlx::query(&alter).execute(&mut *tx).await?;
-        if def.sensitive {
+        if sensitive {
             let bidx = bidx_column(&physical);
             sqlx::query(&format!(
                 "CREATE INDEX \"{bidx}_idx\" ON {table} (organization_id, \"{bidx}\")"
@@ -1255,7 +1271,7 @@ impl Ontology {
         .bind(&validation_json)
         .bind(&preset_json)
         .bind(&max_pii_class)
-        .bind(def.sensitive)
+        .bind(sensitive)
         .execute(&mut *tx)
         .await
         .map_err(|e| match &e {
@@ -1272,7 +1288,7 @@ impl Ontology {
         )
         .bind(field_org)
         .bind(object_id)
-        .bind(serde_json::json!({"api_name": def.api_name, "physical_column": physical, "type": type_name, "sensitive": def.sensitive}))
+        .bind(serde_json::json!({"api_name": def.api_name, "physical_column": physical, "type": type_name, "sensitive": sensitive}))
         .bind(vec![alter.clone()])
         .bind(applied_by)
         .execute(&mut *tx)

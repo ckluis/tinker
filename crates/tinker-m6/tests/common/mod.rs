@@ -76,7 +76,12 @@ pub async fn setup() -> IngestEnv {
     let (org_id, actor_id) = create_org(&owner_pool).await;
 
     let ctx = TenantContext::new(OrganizationId(org_id), actor_id, "m6-test");
-    let pipeline = IngestPipeline::new(core.clone(), owner.clone());
+    // CRM contact email/phone are PII by type: promotion seals them.
+    let sealer = tinker_ontology::sensitive::sealer_from_env()
+        .await
+        .unwrap()
+        .expect("TINKER_PII_URL, TINKER_KEK, TINKER_BLIND_INDEX_KEY must be set");
+    let pipeline = IngestPipeline::new(core.clone(), owner.clone()).with_pii(sealer);
 
     IngestEnv {
         org_id,

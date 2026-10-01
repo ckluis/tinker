@@ -46,12 +46,14 @@ name = "email"
 api_name = "email"
 label = "Email"
 field_type = "email"
+sensitive = true  # PII by type: always vaulted
 
 [[objects.fields]]
 name = "phone"
 api_name = "phone"
 label = "Phone"
 field_type = "phone"
+sensitive = true  # PII by type: always vaulted
 
 [[objects.fields]]
 name = "title"

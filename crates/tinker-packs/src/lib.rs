@@ -247,11 +247,13 @@ impl PackInstaller {
                     Some(row) => {
                         // The physical column differs (UUID ref vs value),
                         // so a flipped flag is not a metadata repair.
-                        if row.sensitive != f.sensitive {
+                        let declared =
+                            f.sensitive || matches!(f.field_type.as_str(), "email" | "phone");
+                        if row.sensitive != declared {
                             return Err(TinkerError::Validation(format!(
                                 "pack field '{}' drifted: declared sensitive={} but installed \
                                  sensitive={}; reinstall refuses to rewrite the column",
-                                f.api_name, f.sensitive, row.sensitive
+                                f.api_name, declared, row.sensitive
                             )));
                         }
                         if row.name != f.name

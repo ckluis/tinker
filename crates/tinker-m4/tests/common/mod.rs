@@ -236,15 +236,31 @@ async fn seed_contact(
         .unwrap();
         row.0
     }
+    // Email is PII by type: seal it and write the ref + blind index.
+    let sealed = tinker_ontology::sensitive::sealer_from_env()
+        .await
+        .unwrap()
+        .expect("TINKER_PII_URL, TINKER_KEK, TINKER_BLIND_INDEX_KEY must be set")
+        .seal_for_write(
+            system_pool,
+            org_id,
+            contact_id,
+            "email",
+            &format!("{name}@example.com"),
+        )
+        .await
+        .unwrap();
     let row: (Uuid,) = sqlx::query_as(&format!(
-        "INSERT INTO data.{} (organization_id, \"{}\", \"{}\") VALUES ($1,$2,$3) RETURNING id",
+        "INSERT INTO data.{} (organization_id, \"{}\", \"{}\", \"{}\") VALUES ($1,$2,$3,$4) RETURNING id",
         slug.0,
         col(system_pool, contact_id, "name").await,
-        col(system_pool, contact_id, "email").await,
+        sealed.ref_column,
+        sealed.bidx_column,
     ))
     .bind(org_id)
     .bind(name)
-    .bind(format!("{name}@example.com"))
+    .bind(sealed.ref_id)
+    .bind(&sealed.bidx)
     .fetch_one(system_pool)
     .await
     .unwrap();

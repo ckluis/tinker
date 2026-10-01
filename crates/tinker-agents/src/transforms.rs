@@ -414,6 +414,25 @@ impl TransformEngine {
                 continue;
             };
             let phys = f.physical_column.as_str();
+            // PII by type / declared sensitive: the column holds a vault
+            // ref, never the value. Agents get the mask whatever the
+            // role's transform says — plaintext PII only ever leaves the
+            // vault through the audited `reveal`, never into a prompt.
+            if f.sensitive {
+                let present = row
+                    .try_get::<Option<Uuid>, _>(phys)
+                    .map_err(TinkerError::Db)?
+                    .is_some();
+                raw.insert(
+                    api.clone(),
+                    if present {
+                        serde_json::Value::String(tinker_ontology::sensitive::MASK.to_string())
+                    } else {
+                        serde_json::Value::Null
+                    },
+                );
+                continue;
+            }
             let v: serde_json::Value = match f.field_type.as_str() {
                 // NUMERIC decodes exactly via BigDecimal — no f64 round-trip
                 // (M6 lesson: decimal canonicalization, not float compare).
@@ -468,7 +487,9 @@ impl TransformEngine {
                 .get(&f.api_name)
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
-            let transform = transforms.get(&f.api_name);
+            // Sensitive values are already the mask: no transform applies
+            // (a token or bucket of the mask would only fake a signal).
+            let transform = transforms.get(&f.api_name).filter(|_| !f.sensitive);
             match transform {
                 None => out.push((f.api_name.clone(), value)),
                 Some(FieldTransform::LlmTransform { provider, profile }) => {

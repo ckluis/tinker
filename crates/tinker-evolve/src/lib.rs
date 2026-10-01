@@ -1038,9 +1038,10 @@ fn validate_evo_field_def(def: &FieldDef) -> Result<()> {
     // Evolved fields live in ext tables the vault path does not cover
     // (docs/pii-sensitive-fields.md, "Not in v1"): refuse, never store a
     // "sensitive" value in plaintext.
-    if def.sensitive {
+    if def.effective_sensitive() {
         return Err(TinkerError::Validation(format!(
-            "field '{}': sensitive fields must be defined on the base object, not evolved",
+            "field '{}': sensitive fields (including every email and phone field) must be \
+             defined on the base object, not evolved",
             def.api_name
         )));
     }

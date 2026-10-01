@@ -51,6 +51,15 @@
 //!     plaintext column. Needs the owner URL plus TINKER_PII_URL,
 //!     TINKER_KEK and TINKER_BLIND_INDEX_KEY. Restart servers afterwards
 //!     (cached plans name the old column), then VACUUM FULL the table.
+//!   tinker-cli pii verify
+//!     The no-plaintext-PII gate: lists every email/phone field that is
+//!     not vault-backed (PII by type) and exits 1 if there is any.
+//!   tinker-cli pii retrofit
+//!     Runs `field make-sensitive` for every field `pii verify` reports.
+//!   tinker-cli pii sweep [--grace-minutes <n>]
+//!     Deletes vault ciphertext no core pii_refs row references (left by
+//!     rolled-back two-phase writes), older than the grace (default 60).
+//!     Needs TINKER_PII_OWNER_URL.
 //!
 //! AuthN is dev-grade (actor resolved by display name within the org); the
 //! authorization pipeline underneath is the real one.
@@ -77,7 +86,8 @@ fn usage() -> ! {
     eprintln!(
         "usage:\n  tinker-cli vfile read --org <slug> --actor <display-name> [--attachment <name>] --path <virtual-path> [--json]\n  tinker-cli mcp serve --org <slug> --actor <display-name> [--attachment <name>]\n  tinker-cli mcp http [--port <port>]\n  tinker-cli mcp key issue --org <slug> --name <name> --scopes <csv> [--ttl-days <n>] [--role <role>]\n  tinker-cli mcp key rotate --org <slug> --id <uuid>\n  tinker-cli mcp key revoke --org <slug> --id <uuid>\n  tinker-cli mcp key list --org <slug>\n  tinker-cli file store --org <slug> --actor <display-name> --name <name> --mime <mime> [--pii-class none|pii|restricted] <path>\n  tinker-cli file get --org <slug> --actor <display-name> --id <file-id> --out <path>\n  tinker-cli file delete --org <slug> --actor <display-name> --id <file-id>
   tinker-cli ingest suggest-mappings --org <slug> --actor <display-name> --target <object-slug> --provider <name> --source-file <path>
-  tinker-cli field make-sensitive --object <object-slug> --field <api_name>"
+  tinker-cli field make-sensitive --object <object-slug> --field <api_name>
+  tinker-cli pii verify | retrofit | sweep [--grace-minutes <n>]"
     );
     std::process::exit(2);
 }
@@ -134,6 +144,7 @@ async fn main() {
         Some("file") => run_file(rest).await,
         Some("ingest") => run_ingest(rest).await,
         Some("field") => run_field(rest).await,
+        Some("pii") => run_pii(rest).await,
         _ => usage(),
     };
     if let Err(e) = rc {
@@ -696,4 +707,102 @@ async fn run_field(args: Vec<String>) -> tinker_core::Result<()> {
         })
     );
     Ok(())
+}
+
+/// Email/phone fields (PII by type) that still store plaintext:
+/// (object_id, object_slug, api_name), defining objects only.
+async fn plaintext_pii_fields(owner: &OwnerDb) -> tinker_core::Result<Vec<(Uuid, String, String)>> {
+    sqlx::query_as(
+        "SELECT o.id, o.api_slug, f.api_name FROM ontology_fields f \
+         JOIN ontology_objects o ON o.id = f.object_id \
+         WHERE f.state = 'active' AND o.adopted_from IS NULL \
+           AND f.field_type IN ('email', 'phone') AND NOT f.sensitive \
+         ORDER BY o.api_slug, f.api_name",
+    )
+    .fetch_all(&owner.0)
+    .await
+    .map_err(tinker_core::TinkerError::Db)
+}
+
+/// `pii verify` / `pii retrofit`: the no-plaintext-PII gate and its fix.
+async fn run_pii(args: Vec<String>) -> tinker_core::Result<()> {
+    let owner = OwnerDb::connect(&env("TINKER_CORE_OWNER_URL")).await?;
+    let fields = plaintext_pii_fields(&owner).await?;
+    match args.first().map(String::as_str) {
+        Some("verify") => {
+            for (_, slug, api) in &fields {
+                println!("plaintext PII: {slug}.{api}");
+            }
+            if fields.is_empty() {
+                println!("ok: every email/phone field is vault-backed");
+                Ok(())
+            } else {
+                Err(tinker_core::TinkerError::Validation(format!(
+                    "{} email/phone field(s) store plaintext; run `tinker-cli pii retrofit`",
+                    fields.len()
+                )))
+            }
+        }
+        Some("sweep") => {
+            let grace = match (args.get(1).map(String::as_str), args.get(2)) {
+                (None, _) => 60,
+                (Some("--grace-minutes"), Some(n)) => n.parse().unwrap_or_else(|_| usage()),
+                _ => usage(),
+            };
+            let pii_owner = sqlx::PgPool::connect(&env("TINKER_PII_OWNER_URL"))
+                .await
+                .map_err(tinker_core::TinkerError::Db)?;
+            let removed = tinker_ontology::sensitive::sweep_orphans(
+                &owner.0,
+                &pii_owner,
+                chrono::Duration::minutes(grace),
+            )
+            .await?;
+            println!("sweep: {removed} orphaned vault value(s) destroyed (grace {grace} min)");
+            Ok(())
+        }
+        Some("retrofit") => {
+            let sealer = tinker_ontology::sensitive::sealer_from_env()
+                .await?
+                .ok_or_else(|| {
+                    tinker_core::TinkerError::Validation(
+                        "pii retrofit needs TINKER_PII_URL, TINKER_KEK and TINKER_BLIND_INDEX_KEY"
+                            .into(),
+                    )
+                })?;
+            let core = CoreDb::connect(&env("TINKER_CORE_URL")).await?;
+            let ingest = tinker_ingest::IngestPipeline::new(core, owner.clone());
+            let (mut done, mut failed) = (0usize, 0usize);
+            for (object_id, slug, api) in &fields {
+                let res = async {
+                    let r = sealer.make_field_sensitive(&owner, *object_id, api).await?;
+                    let n = ingest.retrofit_sensitive(&sealer, slug, api).await?;
+                    Ok::<_, tinker_core::TinkerError>((r, n))
+                }
+                .await;
+                match res {
+                    Ok((r, n)) => {
+                        done += 1;
+                        println!(
+                            "sealed {slug}.{api}: {} rows, {} history copies, {n} ingest copies",
+                            r.rows, r.history_copies
+                        );
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("FAILED {slug}.{api}: {e}");
+                    }
+                }
+            }
+            println!("retrofit: {done} field(s) sealed, {failed} failed");
+            if failed > 0 {
+                return Err(tinker_core::TinkerError::Validation(format!(
+                    "{failed} field(s) could not be retrofitted"
+                )));
+            }
+            println!("next: restart servers; VACUUM FULL the touched tables; rotate older backups");
+            Ok(())
+        }
+        _ => usage(),
+    }
 }

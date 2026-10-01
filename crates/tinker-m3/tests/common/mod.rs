@@ -246,12 +246,19 @@ pub async fn setup() -> CrmEnv {
     }
 
     let broker = tinker_auth::AuthBroker::new(vec![]);
-    let state = tinker_web::build_state(
+    // The CRM pack's email/phone are PII by type: the server needs the
+    // vault (masking, blind-index lookups) like any production server.
+    let pii = tinker_ontology::sensitive::sealer_from_env()
+        .await
+        .unwrap()
+        .expect("TINKER_PII_URL, TINKER_KEK, TINKER_BLIND_INDEX_KEY must be set");
+    let state = tinker_web::build_state_with_pii(
         tenant_pool.clone(),
         system_pool.clone(),
         broker,
         "tinker.test".into(),
         false,
+        Some(pii),
     );
     let router = tinker_web::build_router(state.clone());
 
@@ -339,18 +346,41 @@ async fn seed_org(
     .await
     .unwrap();
 
+    // Email and phone are PII by type: sealed, written as ref + blind index.
+    let sealer = tinker_ontology::sensitive::sealer_from_env()
+        .await
+        .unwrap()
+        .expect("TINKER_PII_URL, TINKER_KEK, TINKER_BLIND_INDEX_KEY must be set");
+    let email = sealer
+        .seal_for_write(
+            system_pool,
+            org_id,
+            contact_id,
+            "email",
+            &format!("{contact_name}@example.com"),
+        )
+        .await
+        .unwrap();
+    let phone = sealer
+        .seal_for_write(system_pool, org_id, contact_id, "phone", "555-0100")
+        .await
+        .unwrap();
     let contact_row: (Uuid,) = sqlx::query_as(&format!(
-        "INSERT INTO data.{ctslug} (organization_id, \"{}\", \"{}\", \"{}\", \"{}\", \"{}\") VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
+        "INSERT INTO data.{ctslug} (organization_id, \"{}\", \"{}\", \"{}\", \"{}\", \"{}\", \"{}\", \"{}\") VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id",
         col(system_pool, contact_id, "name").await,
-        col(system_pool, contact_id, "email").await,
-        col(system_pool, contact_id, "phone").await,
+        email.ref_column,
+        email.bidx_column,
+        phone.ref_column,
+        phone.bidx_column,
         col(system_pool, contact_id, "title").await,
         col(system_pool, contact_id, "company").await,
     ))
     .bind(org_id)
     .bind(contact_name)
-    .bind(format!("{contact_name}@example.com"))
-    .bind("555-0100")
+    .bind(email.ref_id)
+    .bind(&email.bidx)
+    .bind(phone.ref_id)
+    .bind(&phone.bidx)
     .bind("VP Sales")
     .bind(company_row.0)
     .fetch_one(system_pool)

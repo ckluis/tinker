@@ -563,6 +563,31 @@ async fn sensitive_definitions_are_validated() {
     );
 }
 
+/// Email and phone are PII by type: declared non-sensitive, they are
+/// sealed anyway (as in samen — the type decides, not the author).
+#[tokio::test]
+async fn email_and_phone_are_sensitive_by_type() {
+    let env = setup().await;
+    let ctx = new_org(&env).await;
+    let ont = Ontology::new(env.core.clone(), OwnerDb(env.core_owner.clone()));
+    let (object_id, _) = contact_object(&env, &ctx).await;
+    ont.add_field(
+        &ctx,
+        object_id,
+        &field("work_email", FieldType::Email, false),
+    )
+    .await
+    .unwrap();
+    ont.add_field(&ctx, object_id, &field("mobile", FieldType::Phone, false))
+        .await
+        .unwrap();
+    let desc = ont.describe_object(&ctx, object_id).await.unwrap();
+    for api in ["work_email", "mobile"] {
+        let f = desc.fields.iter().find(|f| f.api_name == api).unwrap();
+        assert!(f.sensitive, "{api} must be sensitive by type");
+    }
+}
+
 /// Retrofit: an existing, populated plaintext field becomes sensitive.
 /// Every live value and every plaintext copy in the mutation audit is
 /// sealed, the plaintext column is dropped, and the field then behaves
@@ -590,7 +615,7 @@ async fn populated_field_can_be_made_sensitive() {
     ont.add_field(&ctx, meta.id, &field("name", FieldType::Text, false))
         .await
         .unwrap();
-    ont.add_field(&ctx, meta.id, &field("email", FieldType::Email, false))
+    ont.add_field(&ctx, meta.id, &field("national_id", FieldType::Text, false))
         .await
         .unwrap();
     let admin = issue_key(
@@ -602,11 +627,11 @@ async fn populated_field_can_be_made_sensitive() {
     .await;
     let before = door(&env, &admin, true).await;
     let mut ids = vec![];
-    for (n, e) in [("Ann", "ann@legacy.example"), ("Bob", "bob@legacy.example")] {
+    for (n, e) in [("Ann", "NI-ANN-0001"), ("Bob", "NI-BOB-0002")] {
         let r = tool(
             &before,
             "create_record",
-            json!({"object": slug, "values": {"name": n, "email": e}}),
+            json!({"object": slug, "values": {"name": n, "national_id": e}}),
         )
         .await
         .unwrap();
@@ -615,14 +640,14 @@ async fn populated_field_can_be_made_sensitive() {
     tool(
         &before,
         "update_record",
-        json!({"object": slug, "record_id": ids[0], "values": {"email": "ann@new.example"}}),
+        json!({"object": slug, "record_id": ids[0], "values": {"national_id": "NI-ANN-0099"}}),
     )
     .await
     .unwrap();
 
     let sealer = sealer_from_env().await.unwrap().unwrap();
     let report = sealer
-        .make_field_sensitive(&OwnerDb(env.core_owner.clone()), meta.id, "email")
+        .make_field_sensitive(&OwnerDb(env.core_owner.clone()), meta.id, "national_id")
         .await
         .unwrap();
     assert_eq!(report.rows, 2);
@@ -644,7 +669,7 @@ async fn populated_field_can_be_made_sensitive() {
     .unwrap();
     for text in rows.iter().chain(audit.iter()) {
         assert!(
-            !text.contains("legacy.example") && !text.contains("new.example"),
+            !text.contains("NI-ANN") && !text.contains("NI-BOB"),
             "{text}"
         );
     }
@@ -662,19 +687,19 @@ async fn populated_field_can_be_made_sensitive() {
     )
     .await
     .unwrap();
-    assert_eq!(rec["record"]["email"], MASK);
+    assert_eq!(rec["record"]["national_id"], MASK);
     assert_eq!(
-        reveal(&after, &slug, &ids[0], "email").await.unwrap()["value"],
-        "ann@new.example"
+        reveal(&after, &slug, &ids[0], "national_id").await.unwrap()["value"],
+        "NI-ANN-0099"
     );
     assert_eq!(
-        reveal(&after, &slug, &ids[1], "email").await.unwrap()["value"],
-        "bob@legacy.example"
+        reveal(&after, &slug, &ids[1], "national_id").await.unwrap()["value"],
+        "NI-BOB-0002"
     );
     let hit = tool(
         &after,
         "query",
-        json!({"object": slug, "intent": {"select": ["name"], "filters": [{"field": "email", "op": "eq", "value": "BOB@legacy.example"}]}}),
+        json!({"object": slug, "intent": {"select": ["name"], "filters": [{"field": "national_id", "op": "eq", "value": " NI-BOB-0002 "}]}}),
     )
     .await
     .unwrap();
@@ -683,12 +708,12 @@ async fn populated_field_can_be_made_sensitive() {
     tool(
         &after,
         "create_record",
-        json!({"object": slug, "values": {"email": "cy@new.example"}}),
+        json!({"object": slug, "values": {"national_id": "NI-CY-0003"}}),
     )
     .await
     .unwrap();
     let err = sealer
-        .make_field_sensitive(&OwnerDb(env.core_owner.clone()), meta.id, "email")
+        .make_field_sensitive(&OwnerDb(env.core_owner.clone()), meta.id, "national_id")
         .await
         .unwrap_err();
     assert!(err.to_string().contains("already sensitive"), "{err}");

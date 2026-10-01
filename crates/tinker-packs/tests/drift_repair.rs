@@ -483,14 +483,14 @@ async fn pack_sensitive_field_installs_sealed_and_flip_is_drift() {
         PackDefinition::from_toml(&format!(
             "[pack]\nid = \"pii-{tag}\"\nversion = \"1.0.0\"\nname = \"Pii\"\n\n\
              [[objects]]\nname = \"Person\"\napi_slug = \"pii_person_{tag}\"\nlabel = \"Person\"\n\n\
-             [[objects.fields]]\nname = \"email\"\napi_name = \"email\"\nlabel = \"Email\"\n\
-             field_type = \"email\"\nsensitive = {sensitive}\n"
+             [[objects.fields]]\nname = \"ssn\"\napi_name = \"ssn\"\nlabel = \"SSN\"\n\
+             field_type = \"text\"\nsensitive = {sensitive}\n"
         ))
         .unwrap()
     };
     let installed = installer.install_objects(&pack(true)).await.unwrap();
     let id = installed.objects[&format!("pii_person_{tag}")];
-    let col = physical_column(&owner, id, "email").await;
+    let col = physical_column(&owner, id, "ssn").await;
     let types: Vec<(String, String)> = sqlx::query_as(
         "SELECT column_name::text, data_type::text FROM information_schema.columns \
          WHERE table_schema = 'data' AND table_name = $1 AND column_name LIKE $2 ORDER BY 1",

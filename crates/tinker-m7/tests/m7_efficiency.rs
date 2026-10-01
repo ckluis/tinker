@@ -122,13 +122,14 @@ async fn seed_org(env: &EffEnv, org_id: Uuid) {
     .unwrap();
 
     let c_name = phys(&env.owner, "crm_contact", "name").await;
-    let c_email = phys(&env.owner, "crm_contact", "email").await;
     let c_company = phys(&env.owner, "crm_contact", "company").await;
+    // Email is PII by type (vault ref + blind index); sealing EFF_CONTACTS
+    // values is not what these tripwires measure, so the bulk seed leaves
+    // it NULL — reads still project the field (null, as a masked read would).
     sqlx::query(&format!(
-        "INSERT INTO data.crm_contact (organization_id, \"{c_name}\", \"{c_email}\", \"{c_company}\")
+        "INSERT INTO data.crm_contact (organization_id, \"{c_name}\", \"{c_company}\")
          SELECT $1,
-                'Contact ' || g,
-                'contact-' || $2 || '-' || g || '@example.com',
+                'Contact ' || g || ' ' || $2,
                 comp_ids[(g % {EFF_COMPANIES}) + 1]
          FROM generate_series(1, {EFF_CONTACTS}) g
          CROSS JOIN (SELECT array_agg(id ORDER BY id) AS comp_ids

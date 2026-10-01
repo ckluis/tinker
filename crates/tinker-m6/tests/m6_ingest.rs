@@ -90,13 +90,16 @@ fn is_validation<T>(r: Result<T>) -> bool {
 }
 
 /// Snapshot all canonical contacts (typed columns) for replay comparison.
+/// Email is PII by type: compared by its blind-index digest, which is
+/// deterministic for a value (the vault ref is not compared directly, but
+/// an unchanged digest means no re-seal happened).
 async fn snapshot_contacts(env: &IngestEnv) -> Vec<(Option<String>, Option<String>)> {
     let name_col = phys(env, "crm_contact", "name").await;
-    let email_col = phys(env, "crm_contact", "email").await;
+    let email_bidx = format!("{}__bidx", phys(env, "crm_contact", "email").await);
     let mut tx = env.core.tenant_tx(&env.ctx).await.unwrap();
     let rows = sqlx::query_as::<_, (Option<String>, Option<String>)>(&format!(
-        "SELECT \"{name_col}\", \"{email_col}\" FROM data.crm_contact
-         WHERE organization_id=$1 ORDER BY \"{email_col}\""
+        "SELECT \"{name_col}\", \"{email_bidx}\" FROM data.crm_contact
+         WHERE organization_id=$1 ORDER BY \"{email_bidx}\", \"{name_col}\""
     ))
     .bind(env.org_id)
     .fetch_all(&mut *tx)
@@ -211,16 +214,36 @@ async fn ambiguous_identities_never_auto_merge() {
     seed_salesforce(&env);
 
     // Pre-create TWO canonical contacts sharing the same email as CON-1.
+    // Email is PII by type: each is sealed (own vault ref, same blind
+    // index), so identity matching must find both through the digest.
     let name_col = phys(&env, "crm_contact", "name").await;
-    let email_col = phys(&env, "crm_contact", "email").await;
+    let contact_object: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM ontology_objects WHERE api_slug = 'crm_contact' AND scope_kind = 'platform'",
+    )
+    .fetch_one(&env.owner.0)
+    .await
+    .unwrap();
+    let sealer = sealer_env().await;
     for i in 0..2 {
+        let email = sealer
+            .seal_for_write(
+                &env.owner.0,
+                env.org_id,
+                contact_object,
+                "email",
+                "alice@acme.example",
+            )
+            .await
+            .unwrap();
         sqlx::query(&format!(
-            "INSERT INTO data.crm_contact (organization_id, \"{name_col}\", \"{email_col}\")
-             VALUES ($1, $2, $3)"
+            "INSERT INTO data.crm_contact (organization_id, \"{name_col}\", \"{}\", \"{}\")
+             VALUES ($1, $2, $3, $4)",
+            email.ref_column, email.bidx_column
         ))
         .bind(env.org_id)
         .bind(format!("Alice Candidate {i}"))
-        .bind("alice@acme.example")
+        .bind(email.ref_id)
+        .bind(&email.bidx)
         .execute(&env.owner.0)
         .await
         .unwrap();
@@ -2513,8 +2536,9 @@ async fn snapshot_cursor_marks_missing_as_deleted() {
     );
 }
 
-/// A one-object pack (`name`, `email`) plus a fake-Salesforce lead stream
-/// mapped into it. `sensitive` sets the email field's flag at install.
+/// A one-object pack (`name`, `email` — PII by type, always sealed — and
+/// `tax_id`, a text field whose `sensitive` flag is the parameter) plus a
+/// fake-Salesforce lead stream mapped into it.
 struct LeadStream {
     slug: String,
     stream_id: uuid::Uuid,
@@ -2524,7 +2548,7 @@ struct LeadStream {
 async fn lead_stream(
     env: &IngestEnv,
     pipeline: &tinker_ingest::IngestPipeline,
-    sensitive: bool,
+    tax_id_sensitive: bool,
 ) -> LeadStream {
     let tag = &uuid::Uuid::now_v7().simple().to_string()[20..32];
     let slug = format!("pii_lead_{tag}");
@@ -2532,8 +2556,9 @@ async fn lead_stream(
         "[pack]\nid = \"pii-lead-{tag}\"\nversion = \"1.0.0\"\nname = \"Leads\"\n\n\
          [[objects]]\nname = \"Lead\"\napi_slug = \"{slug}\"\nlabel = \"Lead\"\n\n\
          [[objects.fields]]\nname = \"name\"\napi_name = \"name\"\nlabel = \"Name\"\nfield_type = \"text\"\n\n\
-         [[objects.fields]]\nname = \"email\"\napi_name = \"email\"\nlabel = \"Email\"\n\
-         field_type = \"email\"\nsensitive = {sensitive}\n"
+         [[objects.fields]]\nname = \"email\"\napi_name = \"email\"\nlabel = \"Email\"\nfield_type = \"email\"\n\n\
+         [[objects.fields]]\nname = \"tax_id\"\napi_name = \"tax_id\"\nlabel = \"Tax ID\"\n\
+         field_type = \"text\"\nsensitive = {tax_id_sensitive}\n"
     ))
     .unwrap();
     tinker_packs::PackInstaller::new(
@@ -2559,6 +2584,10 @@ async fn lead_stream(
                 name: "Email".into(),
                 type_name: "string".into(),
             },
+            tinker_ingest::SourceField {
+                name: "TaxId".into(),
+                type_name: "string".into(),
+            },
         ],
         vec![tinker_ingest::SourceRecord {
             source_id: "LEAD-1".into(),
@@ -2571,6 +2600,7 @@ async fn lead_stream(
                     "Email".to_string(),
                     serde_json::json!("Grace.Hopper@Navy.mil"),
                 ),
+                ("TaxId".to_string(), serde_json::json!("TX-HOPPER-1906")),
             ]
             .into_iter()
             .collect(),
@@ -2599,7 +2629,11 @@ async fn lead_stream(
         )
         .await
         .unwrap();
-    for (src, tgt) in [("FullName", "name"), ("Email", "email")] {
+    for (src, tgt) in [
+        ("FullName", "name"),
+        ("Email", "email"),
+        ("TaxId", "tax_id"),
+    ] {
         pipeline
             .mappings()
             .put_mapping(&env.ctx, stream.id, src, &slug, tgt)
@@ -2698,7 +2732,7 @@ async fn ingest_seals_sensitive_fields_and_scrubs_landing() {
     );
     for c in &copies {
         assert!(
-            !c.to_lowercase().contains("navy.mil"),
+            !c.to_lowercase().contains("navy.mil") && !c.contains("TX-HOPPER"),
             "plaintext copy: {c}"
         );
     }
@@ -2763,14 +2797,16 @@ async fn lead_ref(env: &IngestEnv, l: &LeadStream) -> (uuid::Uuid, i64) {
 async fn ingested_plaintext_field_retrofits_to_sensitive() {
     let env = setup().await;
     let sealer = sealer_env().await;
-    let plain = tinker_ingest::IngestPipeline::new(env.core.clone(), env.owner.clone());
-    let l = lead_stream(&env, &plain, false).await;
-    run_lead(&env, &plain, &l, RunMode::Incremental).await;
+    // Email is sealed from the start (PII by type); tax_id starts plaintext.
+    let sealing = tinker_ingest::IngestPipeline::new(env.core.clone(), env.owner.clone())
+        .with_pii(sealer.clone());
+    let l = lead_stream(&env, &sealing, false).await;
+    run_lead(&env, &sealing, &l, RunMode::Incremental).await;
     assert!(
         lead_copies(&env, &l)
             .await
             .iter()
-            .any(|c| c.contains("Grace.Hopper@Navy.mil")),
+            .any(|c| c.contains("TX-HOPPER-1906")),
         "precondition: plaintext before the retrofit"
     );
 
@@ -2781,20 +2817,18 @@ async fn ingested_plaintext_field_retrofits_to_sensitive() {
             .await
             .unwrap();
     let report = sealer
-        .make_field_sensitive(&env.owner, object_id, "email")
+        .make_field_sensitive(&env.owner, object_id, "tax_id")
         .await
         .unwrap();
     assert!(report.rows >= 1);
-    let sealing = tinker_ingest::IngestPipeline::new(env.core.clone(), env.owner.clone())
-        .with_pii(sealer.clone());
     let replaced = sealing
-        .retrofit_sensitive(&sealer, &l.slug, "email")
+        .retrofit_sensitive(&sealer, &l.slug, "tax_id")
         .await
         .unwrap();
     assert_eq!(replaced, 2, "one landing copy + one provenance value");
     for c in lead_copies(&env, &l).await {
         assert!(
-            !c.to_lowercase().contains("navy.mil"),
+            !c.contains("TX-HOPPER"),
             "plaintext copy after retrofit: {c}"
         );
     }
@@ -2807,9 +2841,6 @@ async fn ingested_plaintext_field_retrofits_to_sensitive() {
         "digest match: nothing re-sealed"
     );
     for c in lead_copies(&env, &l).await {
-        assert!(
-            !c.to_lowercase().contains("navy.mil"),
-            "plaintext reintroduced: {c}"
-        );
+        assert!(!c.contains("TX-HOPPER"), "plaintext reintroduced: {c}");
     }
 }

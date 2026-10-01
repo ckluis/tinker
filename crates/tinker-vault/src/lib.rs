@@ -300,6 +300,67 @@ impl Vault {
         Ok(id)
     }
 
+    /// Phase 1 of the two-phase write for many values at once: one DEK
+    /// lookup, in-process encryption, one bulk insert. Items are
+    /// `(subject, storage_class, plaintext)`; returns the ref ids in order.
+    /// The caller commits the core `pii_refs` rows (bulk) afterwards.
+    pub async fn seal_batch(
+        &self,
+        ctx: &TenantContext,
+        items: &[(Uuid, String, String)],
+    ) -> Result<Vec<Uuid>> {
+        if items.is_empty() {
+            return Ok(vec![]);
+        }
+        let (dek, dek_id) = self.dek(ctx).await?;
+        let mut ids = Vec::with_capacity(items.len());
+        let mut subjects = Vec::with_capacity(items.len());
+        let mut classes = Vec::with_capacity(items.len());
+        let mut cts = Vec::with_capacity(items.len());
+        let mut nonces = Vec::with_capacity(items.len());
+        for (subject, class, plaintext) in items {
+            let (nonce, ct) = seal_bytes(&dek, plaintext.as_bytes())?;
+            ids.push(Uuid::now_v7());
+            subjects.push(*subject);
+            classes.push(class.clone());
+            cts.push(ct);
+            nonces.push(nonce);
+        }
+        let mut tx = self.pii.tenant_tx(ctx).await?;
+        sqlx::query(
+            "INSERT INTO pii_values \
+             (id, organization_id, subject_id, storage_class, ciphertext, nonce, wrapped_dek_id) \
+             SELECT i, $2, s, c, ct, n, $7 \
+             FROM unnest($1::uuid[], $3::uuid[], $4::text[], $5::bytea[], $6::bytea[]) \
+                  AS v(i, s, c, ct, n)",
+        )
+        .bind(&ids)
+        .bind(ctx.organization_id.0)
+        .bind(&subjects)
+        .bind(&classes)
+        .bind(&cts)
+        .bind(&nonces)
+        .bind(dek_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(ids)
+    }
+
+    /// Destroy many values of one organization (best-effort cleanup of a
+    /// failed two-phase write, or bulk erasure). Returns rows destroyed.
+    pub async fn destroy_many(&self, ctx: &TenantContext, ref_ids: &[Uuid]) -> Result<u64> {
+        let mut tx = self.pii.tenant_tx(ctx).await?;
+        let n = sqlx::query("DELETE FROM pii_values WHERE organization_id = $1 AND id = ANY($2)")
+            .bind(ctx.organization_id.0)
+            .bind(ref_ids)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(n)
+    }
+
     /// Revoke disclosure, then destroy the ciphertext (erasure = key/data
     /// destruction; the core token is tombstoned by the caller).
     pub async fn destroy(&self, ctx: &TenantContext, ref_id: Uuid) -> Result<()> {
