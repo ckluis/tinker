@@ -562,3 +562,134 @@ async fn sensitive_definitions_are_validated() {
         "{err}"
     );
 }
+
+/// Retrofit: an existing, populated plaintext field becomes sensitive.
+/// Every live value and every plaintext copy in the mutation audit is
+/// sealed, the plaintext column is dropped, and the field then behaves
+/// exactly like one declared sensitive from the start.
+#[tokio::test]
+async fn populated_field_can_be_made_sensitive() {
+    let env = setup().await;
+    let ctx = new_org(&env).await;
+    let ont = Ontology::new(env.core.clone(), OwnerDb(env.core_owner.clone()));
+    let slug = uniq("legacy");
+    let meta = ont
+        .define_object(
+            &ctx,
+            &ObjectDef {
+                name: slug.clone(),
+                api_slug: slug.clone(),
+                label: slug.clone(),
+                scope: Scope::Organization,
+                pack_id: None,
+                pack_version: None,
+            },
+        )
+        .await
+        .unwrap();
+    ont.add_field(&ctx, meta.id, &field("name", FieldType::Text, false))
+        .await
+        .unwrap();
+    ont.add_field(&ctx, meta.id, &field("email", FieldType::Email, false))
+        .await
+        .unwrap();
+    let admin = issue_key(
+        &env,
+        ctx.organization_id.0,
+        "admin",
+        &["mcp:tools", "mcp:tool:reveal"],
+    )
+    .await;
+    let before = door(&env, &admin, true).await;
+    let mut ids = vec![];
+    for (n, e) in [("Ann", "ann@legacy.example"), ("Bob", "bob@legacy.example")] {
+        let r = tool(
+            &before,
+            "create_record",
+            json!({"object": slug, "values": {"name": n, "email": e}}),
+        )
+        .await
+        .unwrap();
+        ids.push(r["record_id"].as_str().unwrap().to_string());
+    }
+    tool(
+        &before,
+        "update_record",
+        json!({"object": slug, "record_id": ids[0], "values": {"email": "ann@new.example"}}),
+    )
+    .await
+    .unwrap();
+
+    let sealer = sealer_from_env().await.unwrap().unwrap();
+    let report = sealer
+        .make_field_sensitive(&OwnerDb(env.core_owner.clone()), meta.id, "email")
+        .await
+        .unwrap();
+    assert_eq!(report.rows, 2);
+    // create x2 (after) + update (before + after) = 4 audit copies.
+    assert_eq!(report.history_copies, 4);
+
+    // No plaintext anywhere for this object.
+    let rows: Vec<String> =
+        sqlx::query_scalar(&format!("SELECT to_jsonb(t)::text FROM data.{slug} t"))
+            .fetch_all(&env.core_owner)
+            .await
+            .unwrap();
+    let audit: Vec<String> = sqlx::query_scalar(
+        "SELECT coalesce(before_json::text, '') || after_json::text FROM mutation_audit WHERE object_id = $1",
+    )
+    .bind(meta.id)
+    .fetch_all(&env.core_owner)
+    .await
+    .unwrap();
+    for text in rows.iter().chain(audit.iter()) {
+        assert!(
+            !text.contains("legacy.example") && !text.contains("new.example"),
+            "{text}"
+        );
+    }
+    assert!(
+        rows.iter().all(|r| r.contains("Ann") || r.contains("Bob")),
+        "other fields intact"
+    );
+
+    // Behaves like a born-sensitive field (fresh state: caches start cold).
+    let after = door(&env, &admin, true).await;
+    let rec = tool(
+        &after,
+        "get_record",
+        json!({"object": slug, "record_id": ids[0]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rec["record"]["email"], MASK);
+    assert_eq!(
+        reveal(&after, &slug, &ids[0], "email").await.unwrap()["value"],
+        "ann@new.example"
+    );
+    assert_eq!(
+        reveal(&after, &slug, &ids[1], "email").await.unwrap()["value"],
+        "bob@legacy.example"
+    );
+    let hit = tool(
+        &after,
+        "query",
+        json!({"object": slug, "intent": {"select": ["name"], "filters": [{"field": "email", "op": "eq", "value": "BOB@legacy.example"}]}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hit["rows"][0]["name"], "Bob", "{hit}");
+    // New writes seal as usual; converting twice is refused.
+    tool(
+        &after,
+        "create_record",
+        json!({"object": slug, "values": {"email": "cy@new.example"}}),
+    )
+    .await
+    .unwrap();
+    let err = sealer
+        .make_field_sensitive(&OwnerDb(env.core_owner.clone()), meta.id, "email")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("already sensitive"), "{err}");
+}

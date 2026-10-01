@@ -320,6 +320,117 @@ impl IngestPipeline {
         }
     }
 
+    /// Ingest half of converting a populated field to sensitive (the core
+    /// half is `PiiSealer::make_field_sensitive`): for every organization
+    /// whose streams map into `object_slug.api_field`, provenance values
+    /// become their blind-index digest and landing copies become digest
+    /// markers. Run it right after the core conversion. Returns the number
+    /// of plaintext copies replaced.
+    pub async fn retrofit_sensitive(
+        &self,
+        sealer: &PiiSealer,
+        object_slug: &str,
+        api_field: &str,
+    ) -> Result<usize> {
+        ident::ident("object_slug", object_slug)?;
+        let field: Option<(Uuid, String, bool)> = sqlx::query_as(
+            "SELECT f.id, f.field_type, f.sensitive FROM ontology_fields f \
+             JOIN ontology_objects o ON o.id = f.object_id \
+             WHERE o.api_slug = $1 AND f.api_name = $2 AND f.state = 'active'",
+        )
+        .bind(object_slug)
+        .bind(api_field)
+        .fetch_optional(&self.owner.0)
+        .await
+        .map_err(TinkerError::Db)?;
+        let (field_id, kind, sensitive) =
+            field.ok_or_else(|| TinkerError::NotFound(format!("field {api_field}")))?;
+        if !sensitive {
+            return Err(TinkerError::Validation(format!(
+                "field '{api_field}' is not sensitive yet: convert the canonical field first"
+            )));
+        }
+        let orgs: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM organizations")
+            .fetch_all(&self.owner.0)
+            .await
+            .map_err(TinkerError::Db)?;
+        let mut replaced = 0usize;
+        for org in orgs {
+            let ctx = TenantContext::new(
+                tinker_core::OrganizationId(org),
+                Uuid::nil(),
+                "pii.retrofit",
+            );
+            let digest = |v: &str| sealer.blind_index().digest(org, field_id, &kind, v);
+            let mut tx = self.core.tenant_tx(&ctx).await?;
+            let maps: Vec<(Uuid, String)> = sqlx::query_as(
+                "SELECT stream_id, source_field FROM ingest_mapping \
+                 WHERE organization_id = $1 AND target_object = $2 AND target_field = $3",
+            )
+            .bind(org)
+            .bind(object_slug)
+            .bind(api_field)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(TinkerError::Db)?;
+            for (stream_id, source_field) in &maps {
+                ident::ident("landing field", source_field)?;
+                let table = LandingWriter::table_for(*stream_id);
+                let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+                    .bind(&table)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(TinkerError::Db)?;
+                if !exists {
+                    continue;
+                }
+                let landed: Vec<(String, String)> = sqlx::query_as(&format!(
+                    "SELECT _source_id, \"{source_field}\" #>> '{{}}' FROM {table} \
+                     WHERE organization_id = $1 AND jsonb_typeof(\"{source_field}\") = 'string'"
+                ))
+                .bind(org)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(TinkerError::Db)?;
+                for (source_id, value) in landed {
+                    sqlx::query(&format!(
+                        "UPDATE {table} SET \"{source_field}\" = $3 \
+                         WHERE organization_id = $1 AND _source_id = $2"
+                    ))
+                    .bind(org)
+                    .bind(&source_id)
+                    .bind(sealed_marker(&digest(&value)))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(TinkerError::Db)?;
+                    replaced += 1;
+                }
+                let prov: Vec<(Uuid, String)> = sqlx::query_as(
+                    "SELECT id, value #>> '{}' FROM ingest_provenance \
+                     WHERE organization_id = $1 AND stream_id = $2 AND field = $3 \
+                       AND jsonb_typeof(value) = 'string'",
+                )
+                .bind(org)
+                .bind(stream_id)
+                .bind(api_field)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(TinkerError::Db)?;
+                for (id, value) in prov {
+                    sqlx::query("UPDATE ingest_provenance SET value = $2 WHERE id = $1")
+                        .bind(id)
+                        .bind(serde_json::Value::String(digest(&value)))
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(TinkerError::Db)?;
+                    replaced += 1;
+                }
+            }
+            tx.commit().await?;
+        }
+        Ok(replaced)
+    }
+
     /// Attach the PII vault so streams can promote into sensitive fields.
     /// Without it, a sensitive value fails closed as a conflict review.
     pub fn with_pii(mut self, sealer: PiiSealer) -> Self {

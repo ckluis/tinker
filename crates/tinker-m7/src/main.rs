@@ -43,6 +43,14 @@
 //!     write anywhere in this CLI is the mandated M7 cost-ledger record
 //!     for the model call itself. Applying a proposal goes through the
 //!     governed write paths with the caller's own auth.
+//!   tinker-cli field make-sensitive --object <object-slug> --field <api_name>
+//!     Operator maintenance (docs/pii-sensitive-fields.md "Retrofit"):
+//!     seals every existing value of a text/email/phone field into the
+//!     PII vault, replaces plaintext copies in drafts, versions, the
+//!     mutation audit, ingest provenance and landing, and drops the old
+//!     plaintext column. Needs the owner URL plus TINKER_PII_URL,
+//!     TINKER_KEK and TINKER_BLIND_INDEX_KEY. Restart servers afterwards
+//!     (cached plans name the old column), then VACUUM FULL the table.
 //!
 //! AuthN is dev-grade (actor resolved by display name within the org); the
 //! authorization pipeline underneath is the real one.
@@ -68,7 +76,8 @@ mod mcp_http;
 fn usage() -> ! {
     eprintln!(
         "usage:\n  tinker-cli vfile read --org <slug> --actor <display-name> [--attachment <name>] --path <virtual-path> [--json]\n  tinker-cli mcp serve --org <slug> --actor <display-name> [--attachment <name>]\n  tinker-cli mcp http [--port <port>]\n  tinker-cli mcp key issue --org <slug> --name <name> --scopes <csv> [--ttl-days <n>] [--role <role>]\n  tinker-cli mcp key rotate --org <slug> --id <uuid>\n  tinker-cli mcp key revoke --org <slug> --id <uuid>\n  tinker-cli mcp key list --org <slug>\n  tinker-cli file store --org <slug> --actor <display-name> --name <name> --mime <mime> [--pii-class none|pii|restricted] <path>\n  tinker-cli file get --org <slug> --actor <display-name> --id <file-id> --out <path>\n  tinker-cli file delete --org <slug> --actor <display-name> --id <file-id>
-  tinker-cli ingest suggest-mappings --org <slug> --actor <display-name> --target <object-slug> --provider <name> --source-file <path>"
+  tinker-cli ingest suggest-mappings --org <slug> --actor <display-name> --target <object-slug> --provider <name> --source-file <path>
+  tinker-cli field make-sensitive --object <object-slug> --field <api_name>"
     );
     std::process::exit(2);
 }
@@ -124,6 +133,7 @@ async fn main() {
         Some("mcp") => run_mcp(rest).await,
         Some("file") => run_file(rest).await,
         Some("ingest") => run_ingest(rest).await,
+        Some("field") => run_field(rest).await,
         _ => usage(),
     };
     if let Err(e) = rc {
@@ -620,6 +630,70 @@ async fn run_ingest(args: Vec<String>) -> tinker_core::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(&report).expect("suggestion report serializes")
+    );
+    Ok(())
+}
+
+/// `field make-sensitive`: retrofit a populated field into the vault —
+/// the core half (rows, drafts, versions, mutation audit) then the ingest
+/// half (provenance, landing). Fails closed without a full vault config.
+async fn run_field(args: Vec<String>) -> tinker_core::Result<()> {
+    let mut it = args.into_iter();
+    if it.next().as_deref() != Some("make-sensitive") {
+        usage();
+    }
+    let (mut object, mut field) = (None, None);
+    while let Some(flag) = it.next() {
+        match flag.as_str() {
+            "--object" => object = it.next(),
+            "--field" => field = it.next(),
+            _ => usage(),
+        }
+    }
+    let (object, field) = (
+        object.unwrap_or_else(|| usage()),
+        field.unwrap_or_else(|| usage()),
+    );
+    let sealer = tinker_ontology::sensitive::sealer_from_env()
+        .await?
+        .ok_or_else(|| {
+            tinker_core::TinkerError::Validation(
+                "make-sensitive needs TINKER_PII_URL, TINKER_KEK and TINKER_BLIND_INDEX_KEY".into(),
+            )
+        })?;
+    let owner = OwnerDb::connect(&env("TINKER_CORE_OWNER_URL")).await?;
+    let core = CoreDb::connect(&env("TINKER_CORE_URL")).await?;
+    let object_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM ontology_objects WHERE api_slug = $1 AND adopted_from IS NULL",
+    )
+    .bind(&object)
+    .fetch_all(&owner.0)
+    .await
+    .map_err(tinker_core::TinkerError::Db)?;
+    let [object_id] = object_ids[..] else {
+        return Err(tinker_core::TinkerError::Validation(format!(
+            "object slug '{object}' must name exactly one defining object (found {})",
+            object_ids.len()
+        )));
+    };
+    let report = sealer
+        .make_field_sensitive(&owner, object_id, &field)
+        .await?;
+    let ingest = tinker_ingest::IngestPipeline::new(core, owner)
+        .retrofit_sensitive(&sealer, &object, &field)
+        .await?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "object": object,
+            "field": field,
+            "rows_sealed": report.rows,
+            "history_copies_sealed": report.history_copies,
+            "ingest_copies_replaced": ingest,
+            "dropped_column": report.old_column,
+            "new_column": report.new_column,
+            "next": format!("restart servers; VACUUM FULL data.{object}; rotate backups that predate this run"),
+        })
     );
     Ok(())
 }

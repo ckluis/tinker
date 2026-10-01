@@ -24,7 +24,18 @@ Status: ACCEPTED 2026-09-30. Decisions D1–D3 were made by the operator; the re
 ## Erasure
 `erase_sensitive(ctx, object, record_id)` destroys every vault value for the record (refs referenced by the row, drafts and versions), tombstones the `pii_refs` rows, and nulls the row's sensitive columns. History rows keep their ref ids, which then resolve to "pii value unavailable".
 
+## Retrofit: making a populated field sensitive
+`tinker-cli field make-sensitive --object <slug> --field <api_name>` (or `PiiSealer::make_field_sensitive` followed by `IngestPipeline::retrofit_sensitive`):
+1. Inside one owner transaction, with a `SHARE ROW EXCLUSIVE` lock on the data table, every live value is sealed (per row, per org) into a **new** UUID column plus a blind index.
+2. Every plaintext copy in `record_drafts`, `record_versions` and `mutation_audit` (for the object and its adopters) becomes a sealed form.
+3. The field row is repointed and flagged, and the old column is dropped.
+4. The ingest half replaces provenance values with digests and landing copies with digest markers, so the next ingest run matches by digest and re-seals nothing.
+
+Refused: fields with a preset, fields driving a row filter, and fields that are already sensitive.
+
+**Erasure is not complete until** servers are restarted (cached plans name the old column), `VACUUM FULL` has rewritten the table, and backups taken before the retrofit have aged out. WAL and backups still hold the plaintext until then.
+
 ## Not in v1
-- Toggling `sensitive` on an existing field. That would need a data migration: seal the existing plaintext, then rewrite the column.
+- Turning `sensitive` back off. That would be a disclosure; it is deliberately not offered.
 - Sensitive fields on evolved (`ext_*`) objects; rejected at definition time.
 - Presets on sensitive fields; rejected, because a static preset would sit in plaintext in `ontology_fields.preset_json`.

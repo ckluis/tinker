@@ -2513,14 +2513,19 @@ async fn snapshot_cursor_marks_missing_as_deleted() {
     );
 }
 
-/// Sensitive canonical fields (docs/pii-sensitive-fields.md) through
-/// managed ingestion: promotion seals the value into the vault, matches
-/// identities and runs survivorship on the blind index, records only the
-/// digest as provenance, and scrubs the landing mirror to a digest
-/// marker. A re-run is a no-op: no re-seal, no plaintext reappears.
-#[tokio::test]
-async fn ingest_seals_sensitive_fields_and_scrubs_landing() {
-    let env = setup().await;
+/// A one-object pack (`name`, `email`) plus a fake-Salesforce lead stream
+/// mapped into it. `sensitive` sets the email field's flag at install.
+struct LeadStream {
+    slug: String,
+    stream_id: uuid::Uuid,
+    target: tinker_ingest::pipeline::CanonicalTarget,
+}
+
+async fn lead_stream(
+    env: &IngestEnv,
+    pipeline: &tinker_ingest::IngestPipeline,
+    sensitive: bool,
+) -> LeadStream {
     let tag = &uuid::Uuid::now_v7().simple().to_string()[20..32];
     let slug = format!("pii_lead_{tag}");
     let pack = tinker_packs::PackDefinition::from_toml(&format!(
@@ -2528,7 +2533,7 @@ async fn ingest_seals_sensitive_fields_and_scrubs_landing() {
          [[objects]]\nname = \"Lead\"\napi_slug = \"{slug}\"\nlabel = \"Lead\"\n\n\
          [[objects.fields]]\nname = \"name\"\napi_name = \"name\"\nlabel = \"Name\"\nfield_type = \"text\"\n\n\
          [[objects.fields]]\nname = \"email\"\napi_name = \"email\"\nlabel = \"Email\"\n\
-         field_type = \"email\"\nsensitive = true\n"
+         field_type = \"email\"\nsensitive = {sensitive}\n"
     ))
     .unwrap();
     tinker_packs::PackInstaller::new(
@@ -2538,13 +2543,6 @@ async fn ingest_seals_sensitive_fields_and_scrubs_landing() {
     .install_objects(&pack)
     .await
     .unwrap();
-    let sealer = tinker_ontology::sensitive::sealer_from_env()
-        .await
-        .unwrap()
-        .expect("TINKER_PII_URL, TINKER_KEK, TINKER_BLIND_INDEX_KEY must be set");
-    let pipeline = tinker_ingest::IngestPipeline::new(env.core.clone(), env.owner.clone())
-        .with_pii(sealer.clone());
-
     let source = format!("Lead{tag}");
     env.salesforce.seed_object(
         &source,
@@ -2595,7 +2593,7 @@ async fn ingest_seals_sensitive_fields_and_scrubs_landing() {
             &env.ctx,
             tinker_ingest::control::NewStream {
                 connection_id: conn.id,
-                source_object: source.clone(),
+                source_object: source,
                 cursor_kind: "updated_at".into(),
             },
         )
@@ -2608,87 +2606,109 @@ async fn ingest_seals_sensitive_fields_and_scrubs_landing() {
             .await
             .unwrap();
     }
-    let target = tinker_ingest::pipeline::CanonicalTarget {
-        object_slug: slug.clone(),
-        email_api_field: Some("email".into()),
-    };
-    let run = |mode| {
-        let pipeline = &pipeline;
-        let env = &env;
-        let target = target.clone();
-        async move {
-            pipeline
-                .run(&env.ctx, &env.salesforce, stream.id, &[target], 2, mode)
-                .await
-                .unwrap()
-        }
-    };
-    run(RunMode::Incremental).await;
+    LeadStream {
+        target: tinker_ingest::pipeline::CanonicalTarget {
+            object_slug: slug.clone(),
+            email_api_field: Some("email".into()),
+        },
+        slug,
+        stream_id: stream.id,
+    }
+}
 
-    // Canonical row: ref + digest, no plaintext; reveal round-trips.
+async fn run_lead(
+    env: &IngestEnv,
+    pipeline: &tinker_ingest::IngestPipeline,
+    l: &LeadStream,
+    mode: RunMode,
+) {
+    pipeline
+        .run(
+            &env.ctx,
+            &env.salesforce,
+            l.stream_id,
+            &[l.target.clone()],
+            2,
+            mode,
+        )
+        .await
+        .unwrap();
+}
+
+/// Every place a lead's email could sit in core + ingest, as text.
+async fn lead_copies(env: &IngestEnv, l: &LeadStream) -> Vec<String> {
     let mut tx = env.core.tenant_tx(&env.ctx).await.unwrap();
-    let rows: Vec<String> = sqlx::query_scalar(&format!(
-        "SELECT to_jsonb(t)::text FROM data.{slug} t WHERE organization_id = $1"
+    let mut out: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT to_jsonb(t)::text FROM data.{} t WHERE organization_id = $1",
+        l.slug
     ))
     .bind(env.org_id)
     .fetch_all(&mut *tx)
     .await
     .unwrap();
-    assert_eq!(rows.len(), 1);
+    out.extend(
+        sqlx::query_scalar::<_, String>(&format!(
+            "SELECT to_jsonb(t)::text FROM {} t WHERE organization_id = $1",
+            tinker_ingest::LandingWriter::table_for(l.stream_id)
+        ))
+        .bind(env.org_id)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap(),
+    );
+    out.extend(
+        sqlx::query_scalar::<_, String>(
+            "SELECT value::text FROM ingest_provenance WHERE organization_id = $1 AND stream_id = $2",
+        )
+        .bind(env.org_id)
+        .bind(l.stream_id)
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap(),
+    );
+    tx.commit().await.unwrap();
+    out
+}
+
+fn sealer_env() -> impl std::future::Future<Output = tinker_ontology::sensitive::PiiSealer> {
+    async {
+        tinker_ontology::sensitive::sealer_from_env()
+            .await
+            .unwrap()
+            .expect("TINKER_PII_URL, TINKER_KEK, TINKER_BLIND_INDEX_KEY must be set")
+    }
+}
+
+/// Sensitive canonical fields (docs/pii-sensitive-fields.md) through
+/// managed ingestion: promotion seals the value into the vault, matches
+/// identities and runs survivorship on the blind index, records only the
+/// digest as provenance, and scrubs the landing mirror to a digest
+/// marker. A re-run is a no-op: no re-seal, no plaintext reappears.
+#[tokio::test]
+async fn ingest_seals_sensitive_fields_and_scrubs_landing() {
+    let env = setup().await;
+    let sealer = sealer_env().await;
+    let pipeline = tinker_ingest::IngestPipeline::new(env.core.clone(), env.owner.clone())
+        .with_pii(sealer.clone());
+    let l = lead_stream(&env, &pipeline, true).await;
+    run_lead(&env, &pipeline, &l, RunMode::Incremental).await;
+
+    let copies = lead_copies(&env, &l).await;
     assert!(
-        rows[0].contains("Grace Hopper"),
+        copies.iter().any(|c| c.contains("Grace Hopper")),
         "non-sensitive lands as-is"
     );
-    assert!(!rows[0].to_lowercase().contains("navy.mil"), "{}", rows[0]);
-    let landing: Vec<String> = sqlx::query_scalar(&format!(
-        "SELECT to_jsonb(t)::text FROM {} t WHERE organization_id = $1",
-        tinker_ingest::LandingWriter::table_for(stream.id)
-    ))
-    .bind(env.org_id)
-    .fetch_all(&mut *tx)
-    .await
-    .unwrap();
+    for c in &copies {
+        assert!(
+            !c.to_lowercase().contains("navy.mil"),
+            "plaintext copy: {c}"
+        );
+    }
     assert!(
-        !landing[0].to_lowercase().contains("navy.mil"),
-        "landing scrubbed: {}",
-        landing[0]
+        copies.iter().any(|c| c.contains("$tinker_sealed")),
+        "landing holds the marker"
     );
-    assert!(landing[0].contains("$tinker_sealed"), "{}", landing[0]);
-    let prov: Vec<String> = sqlx::query_scalar(
-        "SELECT value::text FROM ingest_provenance WHERE organization_id = $1 AND field = 'email'",
-    )
-    .bind(env.org_id)
-    .fetch_all(&mut *tx)
-    .await
-    .unwrap();
-    assert_eq!(prov.len(), 1);
-    assert!(
-        !prov[0].to_lowercase().contains("navy"),
-        "provenance holds the digest: {}",
-        prov[0]
-    );
-    let email_col: String = sqlx::query_scalar(
-        "SELECT f.physical_column FROM ontology_fields f JOIN ontology_objects o ON o.id = f.object_id \
-         WHERE o.api_slug = $1 AND f.api_name = 'email'",
-    )
-    .bind(&slug)
-    .fetch_one(&env.owner.0)
-    .await
-    .unwrap();
-    let ref_id: uuid::Uuid = sqlx::query_scalar(&format!(
-        "SELECT \"{email_col}\" FROM data.{slug} WHERE organization_id = $1"
-    ))
-    .bind(env.org_id)
-    .fetch_one(&mut *tx)
-    .await
-    .unwrap();
-    let refs_before: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM pii_refs WHERE organization_id = $1")
-            .bind(env.org_id)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-    tx.commit().await.unwrap();
+    let (ref_id, refs_before) = lead_ref(&env, &l).await;
     assert_eq!(
         sealer
             .reveal(&env.core, &env.ctx, ref_id, "ingest test")
@@ -2699,22 +2719,99 @@ async fn ingest_seals_sensitive_fields_and_scrubs_landing() {
 
     // Full resync: the scrubbed landing row compares by digest — nothing
     // is re-sealed and the canonical ref is unchanged.
-    run(RunMode::FullResync).await;
+    run_lead(&env, &pipeline, &l, RunMode::FullResync).await;
+    assert_eq!(
+        lead_ref(&env, &l).await,
+        (ref_id, refs_before),
+        "no re-seal on an unchanged value"
+    );
+}
+
+/// (canonical email ref, live pii_refs count) for the org.
+async fn lead_ref(env: &IngestEnv, l: &LeadStream) -> (uuid::Uuid, i64) {
+    let email_col: String = sqlx::query_scalar(
+        "SELECT f.physical_column FROM ontology_fields f JOIN ontology_objects o ON o.id = f.object_id \
+         WHERE o.api_slug = $1 AND f.api_name = 'email'",
+    )
+    .bind(&l.slug)
+    .fetch_one(&env.owner.0)
+    .await
+    .unwrap();
     let mut tx = env.core.tenant_tx(&env.ctx).await.unwrap();
-    let refs_after: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM pii_refs WHERE organization_id = $1")
-            .bind(env.org_id)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-    let ref_after: uuid::Uuid = sqlx::query_scalar(&format!(
-        "SELECT \"{email_col}\" FROM data.{slug} WHERE organization_id = $1"
+    let ref_id: uuid::Uuid = sqlx::query_scalar(&format!(
+        "SELECT \"{email_col}\" FROM data.{} WHERE organization_id = $1",
+        l.slug
     ))
     .bind(env.org_id)
     .fetch_one(&mut *tx)
     .await
     .unwrap();
+    let refs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pii_refs WHERE organization_id = $1 AND state = 'active'",
+    )
+    .bind(env.org_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
     tx.commit().await.unwrap();
-    assert_eq!(refs_after, refs_before, "no re-seal on an unchanged value");
-    assert_eq!(ref_after, ref_id);
+    (ref_id, refs)
+}
+
+/// Retrofit through ingest: a plaintext field that ingest already
+/// populated (row, landing, provenance) is converted — core half seals
+/// the row, ingest half digests provenance and markers the landing — and
+/// the next ingest run neither re-seals nor reintroduces plaintext.
+#[tokio::test]
+async fn ingested_plaintext_field_retrofits_to_sensitive() {
+    let env = setup().await;
+    let sealer = sealer_env().await;
+    let plain = tinker_ingest::IngestPipeline::new(env.core.clone(), env.owner.clone());
+    let l = lead_stream(&env, &plain, false).await;
+    run_lead(&env, &plain, &l, RunMode::Incremental).await;
+    assert!(
+        lead_copies(&env, &l)
+            .await
+            .iter()
+            .any(|c| c.contains("Grace.Hopper@Navy.mil")),
+        "precondition: plaintext before the retrofit"
+    );
+
+    let object_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM ontology_objects WHERE api_slug = $1")
+            .bind(&l.slug)
+            .fetch_one(&env.owner.0)
+            .await
+            .unwrap();
+    let report = sealer
+        .make_field_sensitive(&env.owner, object_id, "email")
+        .await
+        .unwrap();
+    assert!(report.rows >= 1);
+    let sealing = tinker_ingest::IngestPipeline::new(env.core.clone(), env.owner.clone())
+        .with_pii(sealer.clone());
+    let replaced = sealing
+        .retrofit_sensitive(&sealer, &l.slug, "email")
+        .await
+        .unwrap();
+    assert_eq!(replaced, 2, "one landing copy + one provenance value");
+    for c in lead_copies(&env, &l).await {
+        assert!(
+            !c.to_lowercase().contains("navy.mil"),
+            "plaintext copy after retrofit: {c}"
+        );
+    }
+
+    let (ref_id, refs) = lead_ref(&env, &l).await;
+    run_lead(&env, &sealing, &l, RunMode::FullResync).await;
+    assert_eq!(
+        lead_ref(&env, &l).await,
+        (ref_id, refs),
+        "digest match: nothing re-sealed"
+    );
+    for c in lead_copies(&env, &l).await {
+        assert!(
+            !c.to_lowercase().contains("navy.mil"),
+            "plaintext reintroduced: {c}"
+        );
+    }
 }

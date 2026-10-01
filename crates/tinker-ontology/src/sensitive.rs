@@ -314,6 +314,265 @@ impl PiiSealer {
     }
 }
 
+/// What [`PiiSealer::make_field_sensitive`] converted.
+#[derive(Debug, Clone)]
+pub struct RetrofitReport {
+    /// Data rows whose value was sealed.
+    pub rows: usize,
+    /// Plaintext copies replaced in drafts, versions and mutation audit.
+    pub history_copies: usize,
+    pub old_column: String,
+    pub new_column: String,
+}
+
+impl PiiSealer {
+    /// Convert an existing, populated field to sensitive (operator
+    /// maintenance; docs/pii-sensitive-fields.md "Retrofit").
+    ///
+    /// In one owner transaction holding a write-blocking lock on the data
+    /// table: every value is sealed (per row, per organization) into a NEW
+    /// UUID column + blind index; every plaintext copy in record drafts,
+    /// version history and the mutation audit (for the object and its
+    /// adopters) is replaced by a sealed form; the field row is repointed
+    /// and flagged; the old plaintext column is dropped. Ingest copies
+    /// (provenance, landing) are converted by `tinker-ingest`'s
+    /// counterpart. Postgres keeps dropped-column bytes until the table is
+    /// rewritten, and WAL / backups keep them until they age out: run
+    /// `VACUUM FULL` on the table and rotate backups to finish erasure.
+    pub async fn make_field_sensitive(
+        &self,
+        owner: &tinker_db::OwnerDb,
+        object_id: Uuid,
+        api_name: &str,
+    ) -> Result<RetrofitReport> {
+        let mut tx = owner.0.begin().await.map_err(TinkerError::Db)?;
+        let field: Option<(Uuid, String, String, bool, serde_json::Value, String)> =
+            sqlx::query_as(
+                "SELECT f.id, f.physical_column, f.field_type, f.sensitive, f.preset_json, o.api_slug \
+                 FROM ontology_fields f JOIN ontology_objects o ON o.id = f.object_id \
+                 WHERE f.object_id = $1 AND f.api_name = $2 AND f.state = 'active' \
+                 FOR UPDATE OF f",
+            )
+            .bind(object_id)
+            .bind(api_name)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(TinkerError::Db)?;
+        let (field_id, old_col, kind, already, preset, slug) =
+            field.ok_or_else(|| TinkerError::NotFound(format!("field {api_name}")))?;
+        if already {
+            return Err(TinkerError::Validation(format!(
+                "field '{api_name}' is already sensitive"
+            )));
+        }
+        if !matches!(kind.as_str(), "text" | "email" | "phone") {
+            return Err(TinkerError::Validation(format!(
+                "field '{api_name}': only text, email and phone fields can be sensitive"
+            )));
+        }
+        if !preset.is_null() {
+            return Err(TinkerError::Validation(format!(
+                "field '{api_name}' carries a write preset; remove it first"
+            )));
+        }
+        let filters: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM row_filters WHERE object_id = $1 AND field_api_name = $2",
+        )
+        .bind(object_id)
+        .bind(api_name)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        if filters > 0 {
+            return Err(TinkerError::Validation(format!(
+                "field '{api_name}' is used by {filters} row filter(s); sensitive fields cannot \
+                 drive row policy — remove them first"
+            )));
+        }
+        let table = format!("data.{slug}");
+        sqlx::query(&format!("LOCK TABLE {table} IN SHARE ROW EXCLUSIVE MODE"))
+            .execute(&mut *tx)
+            .await
+            .map_err(TinkerError::Db)?;
+        let new_col = crate::new_physical_column();
+        let bidx_col = crate::bidx_column(&new_col);
+        sqlx::query(&format!(
+            "ALTER TABLE {table} ADD COLUMN \"{new_col}\" UUID, ADD COLUMN \"{bidx_col}\" TEXT"
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        sqlx::query(&format!(
+            "CREATE INDEX \"{bidx_col}_idx\" ON {table} (organization_id, \"{bidx_col}\")"
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
+
+        let class = format!("pii.{api_name}");
+        let ctx_for = |org: Uuid| {
+            TenantContext::new(
+                tinker_core::OrganizationId(org),
+                Uuid::nil(),
+                "pii.retrofit",
+            )
+        };
+        // 1. Live rows.
+        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(&format!(
+            "SELECT organization_id, id, \"{old_col}\" FROM {table} WHERE \"{old_col}\" IS NOT NULL"
+        ))
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        for (org, id, value) in &rows {
+            let ctx = ctx_for(*org);
+            let (ref_id, bidx) = self
+                .seal_one(&ctx, field_id, &kind, *id, &class, value)
+                .await?;
+            register_refs(
+                &mut tx,
+                &ctx,
+                &[SealedRef {
+                    ref_id,
+                    subject: *id,
+                    storage_class: class.clone(),
+                }],
+            )
+            .await?;
+            sqlx::query(&format!(
+                "UPDATE {table} SET \"{new_col}\" = $3, \"{bidx_col}\" = $4 \
+                 WHERE organization_id = $1 AND id = $2"
+            ))
+            .bind(org)
+            .bind(id)
+            .bind(ref_id)
+            .bind(&bidx)
+            .execute(&mut *tx)
+            .await
+            .map_err(TinkerError::Db)?;
+        }
+
+        // 2. Plaintext copies in history, for the object and its adopters.
+        let mut copies = 0usize;
+        let objects =
+            "(SELECT $1::uuid UNION SELECT id FROM ontology_objects WHERE adopted_from = $1)";
+        for (table_name, key, json_cols) in [
+            // (table, row-key expression as text, plaintext-bearing columns)
+            ("record_drafts", "draft_id::text", &["content"][..]),
+            (
+                "record_versions",
+                "record_id::text || ':' || version_no::text",
+                &["content"][..],
+            ),
+            (
+                "mutation_audit",
+                "id::text",
+                &["before_json", "after_json"][..],
+            ),
+        ] {
+            for col in json_cols {
+                let hits: Vec<(Uuid, String, Uuid, String)> = sqlx::query_as(&format!(
+                    "SELECT organization_id, {key}, \
+                            COALESCE(record_id, '00000000-0000-0000-0000-000000000000'::uuid), \
+                            {col}->>$2 \
+                     FROM {table_name} WHERE object_id IN {objects} \
+                       AND jsonb_typeof({col}->$2) = 'string'"
+                ))
+                .bind(object_id)
+                .bind(api_name)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(TinkerError::Db)?;
+                for (org, key_val, subject, value) in hits {
+                    let ctx = ctx_for(org);
+                    let (ref_id, bidx) = self
+                        .seal_one(&ctx, field_id, &kind, subject, &class, &value)
+                        .await?;
+                    register_refs(
+                        &mut tx,
+                        &ctx,
+                        &[SealedRef {
+                            ref_id,
+                            subject,
+                            storage_class: class.clone(),
+                        }],
+                    )
+                    .await?;
+                    sqlx::query(&format!(
+                        "UPDATE {table_name} SET {col} = jsonb_set({col}, ARRAY[$3], $4) \
+                         WHERE organization_id = $1 AND {key} = $2"
+                    ))
+                    .bind(org)
+                    .bind(&key_val)
+                    .bind(api_name)
+                    .bind(sealed_json(ref_id, &bidx))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(TinkerError::Db)?;
+                    copies += 1;
+                }
+            }
+        }
+
+        // 3. Repoint the field, then drop the plaintext column.
+        sqlx::query(
+            "UPDATE ontology_fields SET physical_column = $2, sensitive = true, \
+             version = version + 1 WHERE id = $1",
+        )
+        .bind(field_id)
+        .bind(&new_col)
+        .execute(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        let drop = format!("ALTER TABLE {table} DROP COLUMN \"{old_col}\"");
+        sqlx::query(&drop)
+            .execute(&mut *tx)
+            .await
+            .map_err(TinkerError::Db)?;
+        sqlx::query(
+            "INSERT INTO ontology_changes \
+             (organization_id, object_id, change_kind, detail, ddl_statements, applied_by) \
+             SELECT organization_id, id, 'field.made_sensitive', $2, $3, NULL \
+             FROM ontology_objects WHERE id = $1",
+        )
+        .bind(object_id)
+        .bind(serde_json::json!({
+            "api_name": api_name,
+            "old_physical_column": old_col,
+            "physical_column": new_col,
+            "rows": rows.len(),
+            "history_copies": copies,
+        }))
+        .bind(vec![drop.clone()])
+        .execute(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        tx.commit().await.map_err(TinkerError::Db)?;
+        Ok(RetrofitReport {
+            rows: rows.len(),
+            history_copies: copies,
+            old_column: old_col,
+            new_column: new_col,
+        })
+    }
+
+    async fn seal_one(
+        &self,
+        ctx: &TenantContext,
+        field_id: Uuid,
+        kind: &str,
+        subject: Uuid,
+        class: &str,
+        value: &str,
+    ) -> Result<(Uuid, String)> {
+        let bidx = self
+            .bidx
+            .digest(ctx.organization_id.0, field_id, kind, value);
+        let ref_id = self.vault.seal(ctx, subject, class, value).await?;
+        Ok((ref_id, bidx))
+    }
+}
+
 /// Build the sealer from the environment for a server process.
 ///
 /// All three of `TINKER_PII_URL` (vault database, PII app role),
