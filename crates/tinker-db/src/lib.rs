@@ -73,6 +73,39 @@ pub struct PiiDb(pub PgPool);
 #[derive(Debug, Clone)]
 pub struct OwnerDb(pub PgPool);
 
+/// Refuse a tenant pool whose role RLS would not bind: a superuser, a
+/// BYPASSRLS role, or the owner of any RLS-enabled table (owners skip
+/// every policy on tables without FORCE ROW LEVEL SECURITY — most of the
+/// schema, including every materialized `data.*` table). Pointing the
+/// tenant URL at the owner (an easy slip: `tinker` and `tinker-mcp` once
+/// read `TINKER_CORE_URL` with opposite meanings) would otherwise run all
+/// tenant traffic unisolated, silently.
+pub async fn assert_rls_bound_role(pool: &PgPool) -> Result<()> {
+    let (role, superuser, bypass, owns_rls_table): (String, bool, bool, bool) = sqlx::query_as(
+        "SELECT r.rolname::text, r.rolsuper, r.rolbypassrls, \
+                EXISTS (SELECT 1 FROM pg_class c \
+                        WHERE c.relowner = r.oid AND c.relrowsecurity) \
+         FROM pg_roles r WHERE r.rolname = current_user",
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(tinker_core::TinkerError::Db)?;
+    if superuser || bypass || owns_rls_table {
+        let why = if superuser {
+            "is a superuser"
+        } else if bypass {
+            "has BYPASSRLS"
+        } else {
+            "owns RLS-protected tables"
+        };
+        return Err(tinker_core::TinkerError::Validation(format!(
+            "tenant pool role '{role}' {why}, so row-level security would not \
+             isolate tenants; point the tenant URL at the app role (tinker_app)"
+        )));
+    }
+    Ok(())
+}
+
 fn pool_options() -> PgPoolOptions {
     PgPoolOptions::new()
         .max_connections(16)
@@ -84,11 +117,14 @@ fn pool_options() -> PgPoolOptions {
 
 impl CoreDb {
     /// Tenant-facing pool: connect as the non-owner app role so RLS applies.
+    /// Fails closed when the URL names a role RLS does not bind (see
+    /// [`assert_rls_bound_role`]).
     pub async fn connect(url: &str) -> Result<Self> {
         let pool = pool_options()
             .connect(url)
             .await
             .map_err(tinker_core::TinkerError::Db)?;
+        assert_rls_bound_role(&pool).await?;
         Ok(Self(pool))
     }
 

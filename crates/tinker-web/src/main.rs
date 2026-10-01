@@ -2,13 +2,17 @@
 //!
 //! Configuration (environment):
 //!
-//! * `TINKER_CORE_URL` — Postgres URL for the operational store (owner
-//!   role; used for migrations and pre-tenant lookups).
-//! * `TINKER_APP_URL` — Postgres URL for the tenant-facing pool (app role,
-//!   RLS always applies).
+//! * `TINKER_CORE_OWNER_URL` — Postgres URL for the owner role
+//!   (migrations, pre-tenant lookups).
+//! * `TINKER_CORE_URL` — Postgres URL for the tenant-facing pool (app
+//!   role, RLS always applies). Same names as `tinker-mcp`/`tinker-cli`.
+//! * Legacy: when `TINKER_APP_URL` is set, it is the app-role URL and
+//!   `TINKER_CORE_URL` is the owner URL (the old layout of this binary).
+//!   Startup refuses any tenant URL whose role RLS does not bind.
 //! * `TINKER_HOST` — public host name, the mandatory host context.
 //! * `TINKER_ADDR` — listen address, default `127.0.0.1:8080`.
-//! * `TINKER_COOKIE_SECURE` — set to `1` when serving HTTPS.
+//! * `TINKER_COOKIE_SECURE` — session cookies carry `Secure` by default;
+//!   set to `0` only for plain-HTTP local development.
 //! * `TINKER_REDIS_URL` — optional Redis URL (e.g.
 //!   `redis://127.0.0.1:6379/`). When set, the SSE signal bus fans out
 //!   across instances via Redis pub/sub (item 30 scale-out spike);
@@ -39,13 +43,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_agent_cli(&args[2..]);
     }
 
-    let core_url = std::env::var("TINKER_CORE_URL").expect("TINKER_CORE_URL");
-    let app_url = std::env::var("TINKER_APP_URL").expect("TINKER_APP_URL");
+    let (core_url, app_url) = db_urls();
     let host_name = std::env::var("TINKER_HOST").unwrap_or_else(|_| "tinker.local".into());
     let addr: SocketAddr = std::env::var("TINKER_ADDR")
         .unwrap_or_else(|_| "127.0.0.1:8080".into())
         .parse()?;
-    let cookie_secure = std::env::var("TINKER_COOKIE_SECURE").as_deref() == Ok("1");
+    // Secure by default: forgetting a flag must not ship session cookies
+    // over plain HTTP. Local plain-HTTP dev opts out explicitly with 0.
+    let cookie_secure = std::env::var("TINKER_COOKIE_SECURE").as_deref() != Ok("0");
 
     let owner = OwnerDb::connect(&core_url).await?;
     // Cluster-wide advisory lock: every instance runs this at startup
@@ -172,8 +177,7 @@ async fn run_describe_cli(args: &[String]) -> Result<(), Box<dyn std::error::Err
         std::process::exit(2);
     }
 
-    let core_url = std::env::var("TINKER_CORE_URL").expect("TINKER_CORE_URL");
-    let app_url = std::env::var("TINKER_APP_URL").expect("TINKER_APP_URL");
+    let (core_url, app_url) = db_urls();
     let owner = tinker_db::OwnerDb::connect(&core_url).await?;
     let core = tinker_db::CoreDb::connect(&app_url).await?;
     let describer = tinker_web::describe::Describer::for_cli(core, owner);
@@ -315,5 +319,28 @@ fn run_agent_cli(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             }
         },
         _ => unreachable!(),
+    }
+}
+
+/// (owner URL, tenant app-role URL).
+///
+/// Canonical names match `tinker-mcp` and `tinker-cli`:
+/// `TINKER_CORE_OWNER_URL` = owner, `TINKER_CORE_URL` = RLS-bound app
+/// role. The legacy layout this binary used to require —
+/// `TINKER_CORE_URL` = owner plus `TINKER_APP_URL` = app role — is still
+/// honored whenever `TINKER_APP_URL` is set. Either way
+/// `CoreDb::connect` refuses a tenant URL that names an RLS-exempt role,
+/// so a swapped pair fails at startup instead of serving unisolated.
+fn db_urls() -> (String, String) {
+    let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+    let need = |k: &str| {
+        var(k).unwrap_or_else(|| {
+            eprintln!("{k} must be set");
+            std::process::exit(2);
+        })
+    };
+    match var("TINKER_APP_URL") {
+        Some(app) => (need("TINKER_CORE_URL"), app),
+        None => (need("TINKER_CORE_OWNER_URL"), need("TINKER_CORE_URL")),
     }
 }

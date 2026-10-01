@@ -1084,17 +1084,18 @@ async fn m7_rows_are_tenant_isolated() {
 // ---------------------------------------------------------------------------
 
 fn cli_read(bin: &str, slug: &str, actor: &str, path: &str) -> String {
-    // The tinker-cli binary reads TINKER_CORE_URL as the OWNER url and
-    // TINKER_APP_URL as the app-role url; the harness's ambient
-    // TINKER_CORE_URL is the app-role url, so map explicitly instead
-    // of inheriting.
+    // tinker-cli reads TINKER_CORE_OWNER_URL (owner) and TINKER_CORE_URL
+    // (RLS-bound app role) — the harness's own names. This used to map
+    // the OWNER url into TINKER_CORE_URL (a comment from before the
+    // item-35 rename), which ran the CLI's tenant pool unisolated;
+    // CoreDb::connect now refuses that, so pass the names through.
     let out = std::process::Command::new(bin)
         .env(
-            "TINKER_CORE_URL",
+            "TINKER_CORE_OWNER_URL",
             std::env::var("TINKER_CORE_OWNER_URL").expect("TINKER_CORE_OWNER_URL"),
         )
         .env(
-            "TINKER_APP_URL",
+            "TINKER_CORE_URL",
             std::env::var("TINKER_CORE_URL").expect("TINKER_CORE_URL"),
         )
         .args([

@@ -248,14 +248,15 @@ async fn spawned_binary_serves_full_mcp_session() {
 
     let mut child = Command::new(bin)
         .args(["mcp", "serve", "--org", &org_slug, "--actor", "exec"])
-        // The tinker binary reads TINKER_CORE_URL as the OWNER url and
-        // TINKER_APP_URL as the app-role url; the harness's ambient
-        // TINKER_CORE_URL is the app-role url, so map explicitly.
+        // tinker-cli reads TINKER_CORE_OWNER_URL (owner) and
+        // TINKER_CORE_URL (RLS-bound app role). Mapping the owner url into
+        // TINKER_CORE_URL (pre-item-35 naming) ran the tenant pool
+        // unisolated; CoreDb::connect now refuses it.
         .env(
-            "TINKER_CORE_URL",
+            "TINKER_CORE_OWNER_URL",
             std::env::var("TINKER_CORE_OWNER_URL").unwrap(),
         )
-        .env("TINKER_APP_URL", std::env::var("TINKER_CORE_URL").unwrap())
+        .env("TINKER_CORE_URL", std::env::var("TINKER_CORE_URL").unwrap())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
