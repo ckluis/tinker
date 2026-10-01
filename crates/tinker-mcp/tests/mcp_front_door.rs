@@ -138,6 +138,7 @@ fn text_field(api_name: &str, required: bool) -> FieldDef {
         validation: ValidationRules::default(),
         preset: None,
         max_pii_class: "none".into(),
+        sensitive: false,
     }
 }
 
@@ -518,7 +519,7 @@ async fn grant_machine_role_roundtrip() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_advertises_the_seven_tools() {
+async fn tools_list_advertises_the_eight_tools() {
     let env = setup().await;
     let ctx = new_org(&env).await;
     let door = full_door(&env, ctx.organization_id.0).await;
@@ -533,10 +534,12 @@ async fn tools_list_advertises_the_seven_tools() {
         "update_record",
         "transition",
         "render_dashboard",
+        // Sensitive fields: the explicit-scope plaintext path.
+        "reveal",
     ] {
         assert!(names.contains(&want), "tool {want} advertised: {names:?}");
     }
-    assert_eq!(names.len(), 7);
+    assert_eq!(names.len(), 8);
     for t in tools {
         assert!(t["inputSchema"].is_object(), "{} has schema", t["name"]);
     }
@@ -1486,9 +1489,9 @@ async fn pipe_full_conversation() {
     .unwrap();
     pipe.stdin.flush().unwrap();
 
-    // tools/list → seven tools.
+    // tools/list → eight tools (seven + `reveal`).
     let resp = pipe_send(&mut pipe, "tools/list", 2, json!({}));
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 7);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 8);
 
     // tools/call describe → the catalog carries this org's object.
     let resp = pipe_send(

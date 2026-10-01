@@ -126,6 +126,7 @@ fn field(api_name: &str, field_type: FieldType) -> FieldDef {
         validation: ValidationRules::default(),
         preset: None,
         max_pii_class: "restricted".into(),
+        sensitive: false,
     }
 }
 

@@ -582,6 +582,7 @@ pub async fn form_add_field(
         validation: Default::default(),
         preset: None,
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
     };
     let def = schema::field_def_from(input, false)?;
     let v = state
@@ -617,6 +618,7 @@ pub async fn form_add_relation(
         validation: Default::default(),
         preset: None,
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
     };
     let def = schema::field_def_from(input, true)?;
     let v = state

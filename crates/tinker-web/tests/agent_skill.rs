@@ -160,6 +160,7 @@ fn field_def_with_options(
         validation,
         preset,
         max_pii_class: "restricted".into(),
+        sensitive: false,
     }
 }
 

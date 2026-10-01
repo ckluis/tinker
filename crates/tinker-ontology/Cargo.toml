@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 tinker-core.workspace = true
 tinker-db.workspace = true
+tinker-vault.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 sqlx = { workspace = true, features = ["bigdecimal"] }

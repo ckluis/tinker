@@ -28,6 +28,7 @@ fn object_def(slug: &str, label: &str) -> ObjectDef {
 fn field(name: &str, api_name: &str) -> FieldDef {
     FieldDef {
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
         validation: Default::default(),
         preset: None,
         name: name.into(),

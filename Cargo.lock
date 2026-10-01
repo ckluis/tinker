@@ -2425,8 +2425,10 @@ name = "tinker-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "thiserror",
  "uuid",
@@ -2797,6 +2799,7 @@ dependencies = [
  "tinker-agents",
  "tinker-core",
  "tinker-db",
+ "tinker-vault",
  "tokio",
  "tracing",
  "uuid",

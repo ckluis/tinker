@@ -28,6 +28,7 @@ fn field(name: &str, api_name: &str, ft: FieldType) -> FieldDef {
     };
     FieldDef {
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
         validation: Default::default(),
         preset: None,
         name: name.into(),

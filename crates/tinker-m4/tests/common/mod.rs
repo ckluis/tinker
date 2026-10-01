@@ -303,6 +303,7 @@ pub async fn get_json(
 pub fn text_field(api_name: &str) -> FieldDef {
     FieldDef {
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
         validation: Default::default(),
         preset: None,
         name: api_name.to_string(),
@@ -318,6 +319,7 @@ pub fn text_field(api_name: &str) -> FieldDef {
 pub fn relation_field(api_name: &str, target: Uuid) -> FieldDef {
     FieldDef {
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
         validation: Default::default(),
         preset: None,
         name: api_name.to_string(),

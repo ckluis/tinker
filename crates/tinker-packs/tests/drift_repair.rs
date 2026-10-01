@@ -172,6 +172,7 @@ async fn reinstall_repairs_drifted_pack() {
             widget_id,
             &FieldDef {
                 max_pii_class: "restricted".to_string(),
+                sensitive: false,
                 validation: Default::default(),
                 preset: None,
                 name: "extra".into(),
@@ -350,6 +351,7 @@ async fn concurrent_cross_pack_slug_collision_converges() {
 fn evo_text_field(api_name: &str) -> FieldDef {
     FieldDef {
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
         validation: Default::default(),
         preset: None,
         name: api_name.to_string(),
@@ -467,5 +469,49 @@ async fn reinstall_does_not_clobber_evolved_fields() {
     assert!(
         nick.extension_table.is_some(),
         "evolved field still lives on its extension table"
+    );
+}
+
+/// A pack can declare a sensitive field (docs/pii-sensitive-fields.md):
+/// it installs as a vault-ref UUID column + blind index, and a reinstall
+/// that flips the flag is drift — never a silent column rewrite.
+#[tokio::test]
+async fn pack_sensitive_field_installs_sealed_and_flip_is_drift() {
+    let (installer, _ontology, owner, _) = setup().await;
+    let tag = rand_tag();
+    let pack = |sensitive: bool| {
+        PackDefinition::from_toml(&format!(
+            "[pack]\nid = \"pii-{tag}\"\nversion = \"1.0.0\"\nname = \"Pii\"\n\n\
+             [[objects]]\nname = \"Person\"\napi_slug = \"pii_person_{tag}\"\nlabel = \"Person\"\n\n\
+             [[objects.fields]]\nname = \"email\"\napi_name = \"email\"\nlabel = \"Email\"\n\
+             field_type = \"email\"\nsensitive = {sensitive}\n"
+        ))
+        .unwrap()
+    };
+    let installed = installer.install_objects(&pack(true)).await.unwrap();
+    let id = installed.objects[&format!("pii_person_{tag}")];
+    let col = physical_column(&owner, id, "email").await;
+    let types: Vec<(String, String)> = sqlx::query_as(
+        "SELECT column_name::text, data_type::text FROM information_schema.columns \
+         WHERE table_schema = 'data' AND table_name = $1 AND column_name LIKE $2 ORDER BY 1",
+    )
+    .bind(format!("pii_person_{tag}"))
+    .bind(format!("{col}%"))
+    .fetch_all(&owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        types,
+        vec![
+            (col.clone(), "uuid".to_string()),
+            (format!("{col}__bidx"), "text".to_string())
+        ]
+    );
+    // Same declaration: idempotent. Flipped flag: named drift error.
+    installer.install_objects(&pack(true)).await.unwrap();
+    let err = installer.install_objects(&pack(false)).await.unwrap_err();
+    assert!(
+        matches!(&err, TinkerError::Validation(m) if m.contains("sensitive")),
+        "{err:?}"
     );
 }

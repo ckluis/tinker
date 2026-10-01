@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod blind_index;
 pub mod handles;
 
 /// The primary tenancy boundary. Every durable row carries one.

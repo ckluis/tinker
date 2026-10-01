@@ -389,6 +389,7 @@ impl FrontDoor {
             "update_record" => self.tool_update_record(&args).await,
             "transition" => self.tool_transition(&args).await,
             "render_dashboard" => self.tool_render_dashboard(&args).await,
+            "reveal" => self.tool_reveal(&args).await,
             _ => {
                 return rpc_error_value(
                     ERR_INVALID_PARAMS,
@@ -610,6 +611,111 @@ impl FrontDoor {
             Some(row) => Ok(serde_json::json!({ "record": row })),
             None => Err(TinkerError::NotFound(format!("record {record_id}"))),
         }
+    }
+
+    /// `reveal`: the only path that returns a sensitive field's plaintext
+    /// (docs/pii-sensitive-fields.md). Authorization runs in the same
+    /// order as every governed read — role, field projection, then the
+    /// record through the role's row policy — before the vault is
+    /// touched, and the vault projector audits the disclosure.
+    async fn tool_reveal(&self, args: &Value) -> Result<Value> {
+        check_unknown_keys(args, &["object", "record_id", "field", "purpose"], "reveal")?;
+        let slug = require_str(args, "object")?;
+        let field = require_str(args, "field")?;
+        let purpose = require_str(args, "purpose")?;
+        let record_id: Uuid = require_str(args, "record_id")?
+            .parse()
+            .map_err(|_| TinkerError::Validation("reveal: \"record_id\" must be a uuid".into()))?;
+        let purpose = purpose.trim();
+        if purpose.len() < 3 || purpose.len() > 500 {
+            return Err(TinkerError::Validation(
+                "reveal: \"purpose\" must be 3-500 chars; it is recorded in the audit trail".into(),
+            ));
+        }
+        if !matches!(self.role.as_str(), "owner" | "admin") {
+            return Err(TinkerError::Forbidden(
+                "reveal needs the owner or admin role".into(),
+            ));
+        }
+        let sealer = self.state.pii.as_ref().ok_or_else(|| {
+            TinkerError::Validation("reveal: this server has no PII vault configured".into())
+        })?;
+        let object_id = self.object_id(&slug).await?;
+        let inputs =
+            tinker_web::meta::query_inputs(&self.state, &self.tenant, &self.role, object_id, None)
+                .await?;
+        // Hidden and unknown fields look the same: not_found.
+        let f = inputs
+            .desc
+            .fields
+            .iter()
+            .find(|f| f.api_name == field && inputs.projection.allows(object_id, &field))
+            .ok_or_else(|| TinkerError::NotFound(format!("field {field}")))?;
+        if !f.sensitive {
+            return Err(TinkerError::Validation(format!(
+                "reveal: field '{field}' is not sensitive; read it with get_record"
+            )));
+        }
+        // The record must be visible to this role through its row policy.
+        let intent = QueryIntent {
+            from: object_id,
+            select: vec!["__id".to_string()],
+            filters: vec![tinker_query::Filter {
+                field: "__id".to_string(),
+                op: tinker_query::FilterOp::Eq,
+                value: Value::from(record_id.to_string()),
+            }],
+            order: vec![],
+            limit: Some(1),
+            schema_version: None,
+        };
+        let plan = self
+            .state
+            .compiler
+            .compile_with_inputs(
+                &self.tenant,
+                &intent,
+                &inputs.projection,
+                &inputs.policy,
+                &inputs.desc,
+                inputs.version_sel,
+            )
+            .await?;
+        if self
+            .state
+            .executor
+            .execute(&self.tenant, &plan)
+            .await?
+            .is_empty()
+        {
+            return Err(TinkerError::NotFound(format!("record {record_id}")));
+        }
+        let mut tx = self.state.core.tenant_tx(&self.tenant).await?;
+        let ref_id: Option<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT \"{}\" FROM data.{} WHERE organization_id = $1 AND id = $2",
+            f.physical_column, inputs.desc.api_slug
+        ))
+        .bind(self.tenant.organization_id.0)
+        .bind(record_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?
+        .flatten();
+        tx.commit().await.map_err(TinkerError::Db)?;
+        let value = match ref_id {
+            Some(r) => Value::String(
+                sealer
+                    .reveal(&self.state.core, &self.tenant, r, purpose)
+                    .await?,
+            ),
+            None => Value::Null,
+        };
+        Ok(serde_json::json!({
+            "object": slug,
+            "record_id": record_id,
+            "field": field,
+            "value": value,
+        }))
     }
 
     /// Drop cached query plans that read `object_id`, for this
@@ -988,6 +1094,7 @@ fn tool_names() -> Vec<&'static str> {
         "update_record",
         "transition",
         "render_dashboard",
+        "reveal",
     ]
 }
 
@@ -1064,6 +1171,16 @@ fn tools_list_result() -> Value {
                     "comment": { "type": "string", "description": "Reviewer comment (reject, revise)" },
                     "approval_id": { "type": "string", "description": "Bound M7 approval (submit_for_review, publish, archive, unarchive)" }
                 }), &["action"]),
+            ),
+            tool(
+                "reveal",
+                "Return the plaintext of ONE sensitive field (describe marks them `sensitive: true`; every other read returns them masked as \"••••••\"). Requires the owner or admin role and a key with the explicit mcp:tool:reveal scope. Every reveal is audited with its purpose. Hidden fields and invisible records are not_found.",
+                obj(serde_json::json!({
+                    "object": { "type": "string", "description": "Object api_slug" },
+                    "record_id": { "type": "string", "description": "Record UUID" },
+                    "field": { "type": "string", "description": "api_name of a sensitive field" },
+                    "purpose": { "type": "string", "description": "Why this value is needed (3-500 chars); stored in the audit trail" }
+                }), &["object", "record_id", "field", "purpose"]),
             ),
             tool(
                 "render_dashboard",
@@ -1277,7 +1394,9 @@ fn draft_json(draft: &tinker_ontology::lifecycle::Draft) -> Value {
         "object_id": draft.object_id,
         "record_id": draft.record_id,
         "state": draft.state.as_str(),
-        "content": draft.content,
+        // Sensitive values are sealed in drafts; agents see the mask,
+        // never the vault ref or blind index (reveal reads published rows).
+        "content": tinker_ontology::sensitive::mask_sealed(&draft.content),
         "base_version": draft.base_version,
     })
 }
@@ -1291,12 +1410,23 @@ pub fn build_services(
     tenant_pool: sqlx::PgPool,
     system_pool: sqlx::PgPool,
 ) -> Result<(SharedState, MutationConnector, LifecycleEngine)> {
-    let state = tinker_web::build_state(
+    build_services_with_pii(tenant_pool, system_pool, None)
+}
+
+/// [`build_services`] with the PII vault attached to the state, the
+/// mutation connector and the lifecycle engine (sensitive fields).
+pub fn build_services_with_pii(
+    tenant_pool: sqlx::PgPool,
+    system_pool: sqlx::PgPool,
+    pii: Option<tinker_ontology::sensitive::PiiSealer>,
+) -> Result<(SharedState, MutationConnector, LifecycleEngine)> {
+    let state = tinker_web::build_state_with_pii(
         tenant_pool,
         system_pool,
         tinker_auth::AuthBroker::new(vec![]),
         "tinker-mcp".to_string(),
         false,
+        pii.clone(),
     );
     let backend = tinker_agents::files::backend_from_env()
         .map_err(|e| TinkerError::Internal(format!("file backend misconfigured: {e}")))?;
@@ -1304,9 +1434,13 @@ pub fn build_services(
         state.core.clone(),
         backend,
     ));
-    let mutator = MutationConnector::new(state.core.clone(), state.ontology.clone())
+    let mut mutator = MutationConnector::new(state.core.clone(), state.ontology.clone())
         .with_file_validator(store.clone());
-    let lifecycle =
+    let mut lifecycle =
         LifecycleEngine::new(state.core.clone(), state.ontology.clone()).with_file_validator(store);
+    if let Some(p) = pii {
+        mutator = mutator.with_pii(p.clone());
+        lifecycle = lifecycle.with_pii(p);
+    }
     Ok((state, mutator, lifecycle))
 }

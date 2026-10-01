@@ -47,6 +47,7 @@ fn object_def(slug: &str) -> ObjectDef {
 fn field(api_name: &str, field_type: FieldType, required: bool) -> FieldDef {
     FieldDef {
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
         validation: Default::default(),
         preset: None,
         name: api_name.into(),
@@ -942,6 +943,170 @@ async fn draft_edit_retires_pending_and_approved_approvals() {
         .await
         .unwrap_err();
     assert!(matches!(err, TinkerError::Forbidden(_)), "got {err:?}");
+}
+
+/// Sensitive fields through the lifecycle (docs/pii-sensitive-fields.md):
+/// draft content, version history and the published row only ever hold
+/// the sealed form; an edit forks the sealed value out of the row and
+/// republishes it intact; an engine without a vault refuses the value.
+#[tokio::test]
+async fn sensitive_fields_stay_sealed_through_drafts_and_versions() {
+    let env = common::setup().await;
+    let w = setup_world(&env).await;
+    let (ont, _lc, ap, _rt) = engines(&env);
+    let email = FieldDef {
+        name: "Email".into(),
+        api_name: "contact_email".into(),
+        label: "Email".into(),
+        field_type: FieldType::Email,
+        options: serde_json::json!({}),
+        required: false,
+        validation: Default::default(),
+        preset: None,
+        max_pii_class: "restricted".into(),
+        sensitive: true,
+    };
+    ont.add_field(&w.ctx_owner, w.article, &email)
+        .await
+        .unwrap();
+    let sealer = tinker_ontology::sensitive::sealer_from_env()
+        .await
+        .unwrap()
+        .expect("TINKER_PII_URL, TINKER_KEK, TINKER_BLIND_INDEX_KEY must be set");
+    let lc = LifecycleEngine::new(env.core.clone(), ont.clone()).with_pii(sealer.clone());
+
+    let plaintext = "Ada.Lovelace@Example.org";
+    let draft = lc
+        .create_draft(
+            &w.ctx_author,
+            w.article,
+            None,
+            &values(&[("title", "Notes"), ("contact_email", plaintext)]),
+        )
+        .await
+        .unwrap();
+    let sealed = draft.content["contact_email"].clone();
+    assert!(
+        tinker_ontology::sensitive::parse_sealed(&sealed).is_some(),
+        "{sealed}"
+    );
+    assert!(!draft.content.to_string().contains("Lovelace"));
+    // Editing another field keeps the sealed value as-is.
+    let draft = lc
+        .update_draft(
+            &w.ctx_author,
+            draft.draft_id,
+            &values(&[("title", "Notes v2")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(draft.content["contact_email"], sealed);
+
+    let sub = draft_approval(
+        &ap,
+        &w,
+        &w.ctx_reviewer,
+        draft.draft_id,
+        "submit_for_review",
+        Some(true),
+    )
+    .await;
+    lc.submit_for_review(&w.ctx_author, draft.draft_id, sub)
+        .await
+        .unwrap();
+    let publ = draft_approval(
+        &ap,
+        &w,
+        &w.ctx_reviewer,
+        draft.draft_id,
+        "publish",
+        Some(true),
+    )
+    .await;
+    let out = lc
+        .publish(&w.ctx_author, draft.draft_id, publ)
+        .await
+        .unwrap();
+    let versions = lc
+        .list_versions(&w.ctx_viewer, w.article, out.record_id)
+        .await
+        .unwrap();
+    assert!(!versions[0].content.to_string().contains("Lovelace"));
+    assert_eq!(versions[0].content["contact_email"], sealed);
+
+    // Fork the published record: the sealed value comes back out of the
+    // ref + blind-index columns and republishes unchanged.
+    let edit = lc
+        .create_draft(
+            &w.ctx_author,
+            w.article,
+            Some(out.record_id),
+            &values(&[("title", "Notes v3")]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(edit.content["contact_email"], sealed);
+    let sub = draft_approval(
+        &ap,
+        &w,
+        &w.ctx_reviewer,
+        edit.draft_id,
+        "submit_for_review",
+        Some(true),
+    )
+    .await;
+    lc.submit_for_review(&w.ctx_author, edit.draft_id, sub)
+        .await
+        .unwrap();
+    let publ = draft_approval(
+        &ap,
+        &w,
+        &w.ctx_reviewer,
+        edit.draft_id,
+        "publish",
+        Some(true),
+    )
+    .await;
+    lc.publish(&w.ctx_author, edit.draft_id, publ)
+        .await
+        .unwrap();
+    let (ref_id, _) = tinker_ontology::sensitive::parse_sealed(&sealed).unwrap();
+    assert_eq!(
+        sealer
+            .reveal(&env.core, &w.ctx_owner, ref_id, "lifecycle test")
+            .await
+            .unwrap(),
+        plaintext
+    );
+
+    // Erasure reaches the value through the row and version history:
+    // the ref no longer resolves anywhere.
+    let desc = ont.describe_object(&w.ctx_owner, w.article).await.unwrap();
+    assert_eq!(
+        sealer
+            .erase_record(&env.core, &w.ctx_owner, &desc, out.record_id)
+            .await
+            .unwrap(),
+        1
+    );
+    let err = sealer
+        .reveal(&env.core, &w.ctx_owner, ref_id, "after erasure")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("tombstoned"), "{err}");
+
+    // An engine without the vault fails closed on a sensitive value.
+    let bare = LifecycleEngine::new(env.core.clone(), ont);
+    let err = bare
+        .create_draft(
+            &w.ctx_author,
+            w.article,
+            None,
+            &values(&[("title", "x"), ("contact_email", "a@b.co")]),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("no PII vault configured"), "{err}");
 }
 
 // ---------------------------------------------------------------------------

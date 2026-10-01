@@ -24,6 +24,7 @@ fn object_def(slug: &str) -> ObjectDef {
 fn text_field(api_name: &str) -> FieldDef {
     FieldDef {
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
         validation: Default::default(),
         preset: None,
         name: api_name.into(),
@@ -190,6 +191,7 @@ async fn relation_join_compiles_and_executes() {
         deal.id,
         &FieldDef {
             max_pii_class: "restricted".to_string(),
+            sensitive: false,
             validation: Default::default(),
             preset: None,
             name: "company".into(),

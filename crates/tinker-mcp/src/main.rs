@@ -27,7 +27,7 @@
 use tinker_auth::apikey::MachineCredentialStore;
 use tinker_core::{OrganizationId, TenantContext};
 use tinker_db::{CoreDb, OwnerDb};
-use tinker_mcp::{build_services, FrontDoor};
+use tinker_mcp::{build_services_with_pii, FrontDoor};
 
 fn required_env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| {
@@ -103,8 +103,13 @@ async fn run_stdio() -> Result<(), String> {
         cred.actor_id,
         "tinker-mcp".to_string(),
     );
+    // Sensitive fields: the PII vault from the environment. Unset → no
+    // vault (sensitive writes fail closed); partially set → startup error.
+    let pii = tinker_ontology::sensitive::sealer_from_env()
+        .await
+        .map_err(|e| format!("pii vault: {e}"))?;
     let (state, mutator, lifecycle) =
-        build_services(core.0.clone(), owner.0.clone()).map_err(|e| e.to_string())?;
+        build_services_with_pii(core.0.clone(), owner.0.clone(), pii).map_err(|e| e.to_string())?;
     // The role comes from the membership table — the same trusted
     // source the HTTP tier uses. No membership fails closed here, at
     // startup, with the fix spelled out; inventing a default role

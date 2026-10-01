@@ -154,6 +154,7 @@ async fn file_object(env: &Env, ctx: &TenantContext, max_pii: &str) -> Uuid {
         meta.id,
         &FieldDef {
             max_pii_class: max_pii.to_string(),
+            sensitive: false,
             validation: Default::default(),
             preset: None,
             name: "contract".into(),

@@ -88,7 +88,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let broker = AuthBroker::new(adapters);
 
-    let state = tinker_web::build_state(tenant_pool, system_pool, broker, host_name, cookie_secure);
+    // Sensitive fields: the PII vault from the environment (fails loud on
+    // a partial configuration; unset disables sensitive writes).
+    let pii = tinker_ontology::sensitive::sealer_from_env().await?;
+    let state = tinker_web::build_state_with_pii(
+        tenant_pool,
+        system_pool,
+        broker,
+        host_name,
+        cookie_secure,
+        pii,
+    );
     // Item 30: cross-instance SSE signal fan-out. Opt-in via
     // TINKER_REDIS_URL; unset keeps the in-process bus.
     if let Ok(redis_url) = std::env::var("TINKER_REDIS_URL") {

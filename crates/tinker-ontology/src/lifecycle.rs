@@ -92,8 +92,9 @@ use tinker_db::CoreDb;
 use uuid::Uuid;
 
 use super::mutate::{
-    apply_presets, bind_col, coerce, consume_approval, validate_fields, ColVal, FileLinkValidator,
+    apply_presets, bind_col, consume_approval, validate_fields, write_columns, FileLinkValidator,
 };
+use super::sensitive::{register_refs, seal_values, sealed_json, PiiSealer, SealedRef};
 use super::{FieldDescription, ObjectDescription, Ontology};
 
 /// Lifecycle states. `draft`/`in_review`/`rejected` live in
@@ -210,6 +211,7 @@ pub struct LifecycleEngine {
     core: CoreDb,
     ontology: Ontology,
     file_validator: Option<Arc<dyn FileLinkValidator>>,
+    pii: Option<PiiSealer>,
 }
 
 /// One lifecycle transition audit entry. Bundled so clippy's
@@ -230,7 +232,37 @@ impl LifecycleEngine {
             core,
             ontology,
             file_validator: None,
+            pii: None,
         }
+    }
+
+    /// Attach the PII vault for sensitive fields. Draft content, version
+    /// history and the published row then only ever hold sealed values;
+    /// without it, a draft carrying a sensitive value fails closed.
+    pub fn with_pii(mut self, sealer: PiiSealer) -> Self {
+        self.pii = Some(sealer);
+        self
+    }
+
+    /// Seal the CALLER's sensitive values (never stored content, which is
+    /// already sealed) and merge them over `merged`. Runs after
+    /// validation has checked the plaintext.
+    async fn seal_caller_values(
+        &self,
+        ctx: &TenantContext,
+        fields: &[FieldDescription],
+        subject: Uuid,
+        values: &HashMap<String, serde_json::Value>,
+        merged: &mut HashMap<String, serde_json::Value>,
+    ) -> Result<Vec<SealedRef>> {
+        let mut caller: HashMap<String, serde_json::Value> = values
+            .iter()
+            .filter(|(k, _)| fields.iter().any(|f| f.sensitive && &f.api_name == *k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let sealed = seal_values(self.pii.as_ref(), ctx, fields, subject, &mut caller).await?;
+        merged.extend(caller);
+        Ok(sealed)
     }
 
     /// Attach file-field validation for the publish path. When absent,
@@ -412,10 +444,24 @@ impl LifecycleEngine {
             .iter()
             .map(|f| (f.physical_column.as_str(), f.api_name.as_str()))
             .collect();
-        for (k, v) in raw.and_then(|r| r.as_object().cloned()).unwrap_or_default() {
+        let raw = raw.and_then(|r| r.as_object().cloned()).unwrap_or_default();
+        for (k, v) in &raw {
             if let Some(api) = phys_to_api.get(k.as_str()) {
-                out.insert(api.to_string(), v);
+                out.insert(api.to_string(), v.clone());
             }
+        }
+        // Sensitive fields: the row holds ref + blind index; the draft
+        // carries them on as the sealed form, never as plaintext.
+        for f in fields.iter().filter(|f| f.sensitive) {
+            let ref_id = raw.get(&f.physical_column).and_then(|v| v.as_str());
+            let bidx = raw
+                .get(&crate::bidx_column(&f.physical_column))
+                .and_then(|v| v.as_str());
+            let v = match (ref_id.and_then(|r| r.parse().ok()), bidx) {
+                (Some(r), Some(b)) => sealed_json(r, b),
+                _ => serde_json::Value::Null,
+            };
+            out.insert(f.api_name.clone(), v);
         }
         Ok(out)
     }
@@ -507,11 +553,15 @@ impl LifecycleEngine {
         for (k, v) in values {
             merged.insert(k.clone(), v.clone());
         }
-        let merged = apply_presets(&fields, &merged, ctx.actor_id, record_id.is_none());
+        let mut merged = apply_presets(&fields, &merged, ctx.actor_id, record_id.is_none());
         validate_fields(&fields, &merged, record_id.is_none())?;
+        let draft_id = Uuid::now_v7();
+        let sealed = self
+            .seal_caller_values(ctx, &fields, draft_id, values, &mut merged)
+            .await?;
+        register_refs(&mut tx, ctx, &sealed).await?;
         let content = serde_json::to_value(&merged).map_err(TinkerError::Serde)?;
 
-        let draft_id = Uuid::now_v7();
         let row: Option<DraftRow> = sqlx::query_as(&format!(
             "INSERT INTO record_drafts \
              (organization_id, draft_id, object_id, record_id, state, content, base_version, created_by, updated_by) \
@@ -662,8 +712,12 @@ impl LifecycleEngine {
         for (k, v) in values {
             merged.insert(k.clone(), v.clone());
         }
-        let merged = apply_presets(&fields, &merged, ctx.actor_id, draft.record_id.is_none());
+        let mut merged = apply_presets(&fields, &merged, ctx.actor_id, draft.record_id.is_none());
         validate_fields(&fields, &merged, draft.record_id.is_none())?;
+        let sealed = self
+            .seal_caller_values(ctx, &fields, draft_id, values, &mut merged)
+            .await?;
+        register_refs(&mut tx, ctx, &sealed).await?;
         let content = serde_json::to_value(&merged).map_err(TinkerError::Serde)?;
         let row: Option<DraftRow> = sqlx::query_as(&format!(
             "UPDATE record_drafts SET content = $3, updated_by = $4, updated_at = now() \
@@ -864,25 +918,9 @@ impl LifecycleEngine {
         }
         let table = Self::table_slug(&desc.api_slug);
 
-        // Coerce to physical columns (same coercion as direct writes).
-        let mut cols: Vec<&str> = Vec::new();
-        let mut coerced: Vec<ColVal> = Vec::new();
-        for f in &fields {
-            match content_map.get(&f.api_name) {
-                Some(v) if v.is_null() => {
-                    cols.push(f.physical_column.as_str());
-                    coerced.push(ColVal::Null);
-                }
-                Some(v) => {
-                    let cv = coerce(&f.field_type, v).map_err(|e| {
-                        TinkerError::Validation(format!("field '{}': {e}", f.api_name))
-                    })?;
-                    cols.push(f.physical_column.as_str());
-                    coerced.push(cv);
-                }
-                None => {}
-            }
-        }
+        // Coerce to physical columns (same coercion as direct writes;
+        // sensitive fields land as ref + blind index).
+        let (cols, coerced) = write_columns(&fields, &content_map)?;
 
         let record_id;
         let version: i64;

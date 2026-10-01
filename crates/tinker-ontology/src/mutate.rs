@@ -38,6 +38,7 @@
 //! fields are skipped on write; no cross-field rules; no async validators;
 //! preset values are static data or the actor id, never expressions.
 
+use crate::sensitive::{register_refs, seal_values, PiiSealer};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -172,6 +173,13 @@ pub fn validate_fields(
             }
             continue;
         };
+        // A sensitive field's stored (sealed) value was validated as
+        // plaintext before sealing; here it only counts as present.
+        // Callers can never supply this form: `sensitive::seal_values`
+        // rejects any non-string caller value.
+        if f.sensitive && crate::sensitive::parse_sealed(v).is_some() {
+            continue;
+        }
         // Required text-ish fields reject the empty string: "" is not a value.
         if f.required && is_textual_kind(&f.field_type) && v.as_str().is_some_and(|s| s.is_empty())
         {
@@ -349,6 +357,52 @@ pub(crate) fn coerce(kind: &str, v: &serde_json::Value) -> std::result::Result<C
     }
 }
 
+/// Physical columns + bound values for a governed write, in field order.
+/// Explicit null clears an optional column (validate_fields has already
+/// rejected null on required fields). A sensitive field writes two
+/// columns — the vault ref and its blind index — and must arrive in
+/// sealed form: plaintext here means a caller skipped sealing, which
+/// fails closed rather than landing in the row.
+pub(crate) fn write_columns(
+    fields: &[FieldDescription],
+    values: &HashMap<String, serde_json::Value>,
+) -> Result<(Vec<String>, Vec<ColVal>)> {
+    let mut cols = Vec::new();
+    let mut coerced = Vec::new();
+    for f in fields {
+        let Some(v) = values.get(&f.api_name) else {
+            continue;
+        };
+        if f.sensitive {
+            let bidx_col = crate::bidx_column(&f.physical_column);
+            if v.is_null() {
+                cols.extend([f.physical_column.clone(), bidx_col]);
+                coerced.extend([ColVal::Null, ColVal::Null]);
+                continue;
+            }
+            let (ref_id, bidx) = crate::sensitive::parse_sealed(v).ok_or_else(|| {
+                TinkerError::Internal(format!(
+                    "field '{}': sensitive value reached the write unsealed",
+                    f.api_name
+                ))
+            })?;
+            cols.extend([f.physical_column.clone(), bidx_col]);
+            coerced.extend([ColVal::Uid(ref_id), ColVal::Text(bidx)]);
+            continue;
+        }
+        if v.is_null() {
+            cols.push(f.physical_column.clone());
+            coerced.push(ColVal::Null);
+            continue;
+        }
+        let cv = coerce(&f.field_type, v)
+            .map_err(|e| TinkerError::Validation(format!("field '{}': {e}", f.api_name)))?;
+        cols.push(f.physical_column.clone());
+        coerced.push(cv);
+    }
+    Ok((cols, coerced))
+}
+
 pub(crate) fn bind_col<'q>(
     q: sqlx::query::Query<'q, Postgres, PgArguments>,
     v: &'q ColVal,
@@ -453,6 +507,7 @@ pub struct MutationConnector {
     core: CoreDb,
     ontology: Ontology,
     file_validator: Option<Arc<dyn FileLinkValidator>>,
+    pii: Option<PiiSealer>,
 }
 
 impl MutationConnector {
@@ -461,7 +516,15 @@ impl MutationConnector {
             core,
             ontology,
             file_validator: None,
+            pii: None,
         }
+    }
+
+    /// Attach the PII vault for sensitive fields. Without it, a write that
+    /// carries a sensitive value fails closed (never stored in plaintext).
+    pub fn with_pii(mut self, sealer: PiiSealer) -> Self {
+        self.pii = Some(sealer);
+        self
     }
 
     /// Attach file-field validation for the write path. When absent,
@@ -523,39 +586,21 @@ impl MutationConnector {
         }
         let fields = Self::writable(&desc.fields);
 
-        let values = apply_presets(&fields, &req.values, ctx.actor_id, true);
+        let mut values = apply_presets(&fields, &req.values, ctx.actor_id, true);
         validate_fields(&fields, &values, true)?;
         // Item 42 (C7): file references resolve against the governed
         // file registry before the write — fail closed, no oracles.
         self.validate_file_links(ctx, &fields, &values).await?;
+        // Sensitive values leave plaintext here: sealed into the vault
+        // before any copy (row, audit) is made.
+        let record_id = Uuid::now_v7();
+        let sealed = seal_values(self.pii.as_ref(), ctx, &fields, record_id, &mut values).await?;
 
         let mut tx = self.core.tenant_tx(ctx).await?;
         consume_approval(&mut tx, ctx, req.require_approval, req.approval_request_id).await?;
+        register_refs(&mut tx, ctx, &sealed).await?;
 
-        let record_id = Uuid::now_v7();
-        let mut cols: Vec<&str> = Vec::new();
-        let mut coerced: Vec<ColVal> = Vec::new();
-        for f in &fields {
-            match values.get(&f.api_name) {
-                Some(v) if v.is_null() => {
-                    // Explicit null clears an optional field (writes SQL
-                    // NULL; on create this equals omitting the column).
-                    // Required fields never reach here: validate_fields
-                    // rejects null on required fields before this point,
-                    // and a WhenMissing preset would have re-filled it.
-                    cols.push(f.physical_column.as_str());
-                    coerced.push(ColVal::Null);
-                }
-                Some(v) => {
-                    let cv = coerce(&f.field_type, v).map_err(|e| {
-                        TinkerError::Validation(format!("field '{}': {e}", f.api_name))
-                    })?;
-                    cols.push(f.physical_column.as_str());
-                    coerced.push(cv);
-                }
-                None => {}
-            }
-        }
+        let (cols, coerced) = write_columns(&fields, &values)?;
         if cols.is_empty() {
             return Err(TinkerError::Validation(
                 "create has no values to write".into(),
@@ -618,14 +663,17 @@ impl MutationConnector {
         }
         let fields = Self::writable(&desc.fields);
 
-        let values = apply_presets(&fields, &req.values, ctx.actor_id, false);
+        let mut values = apply_presets(&fields, &req.values, ctx.actor_id, false);
         validate_fields(&fields, &values, false)?;
         // Item 42 (C7): file references resolve against the governed
         // file registry before the write — fail closed, no oracles.
         self.validate_file_links(ctx, &fields, &values).await?;
+        let sealed =
+            seal_values(self.pii.as_ref(), ctx, &fields, req.record_id, &mut values).await?;
 
         let mut tx = self.core.tenant_tx(ctx).await?;
         consume_approval(&mut tx, ctx, req.require_approval, req.approval_request_id).await?;
+        register_refs(&mut tx, ctx, &sealed).await?;
 
         let table = Self::table_slug(&desc.api_slug);
         // Lock the row first: precise NotFound vs Conflict, and the
@@ -655,28 +703,7 @@ impl MutationConnector {
             }
         }
 
-        let mut cols: Vec<&str> = Vec::new();
-        let mut coerced: Vec<ColVal> = Vec::new();
-        for f in &fields {
-            match values.get(&f.api_name) {
-                Some(v) if v.is_null() => {
-                    // Explicit null on update clears an optional field.
-                    // Required fields never reach here: validate_fields
-                    // rejects null on required fields before this point,
-                    // and a WhenMissing preset would have re-filled it.
-                    cols.push(f.physical_column.as_str());
-                    coerced.push(ColVal::Null);
-                }
-                Some(v) => {
-                    let cv = coerce(&f.field_type, v).map_err(|e| {
-                        TinkerError::Validation(format!("field '{}': {e}", f.api_name))
-                    })?;
-                    cols.push(f.physical_column.as_str());
-                    coerced.push(cv);
-                }
-                None => {}
-            }
-        }
+        let (cols, coerced) = write_columns(&fields, &values)?;
         if cols.is_empty() {
             return Err(TinkerError::Validation(
                 "update has no values to write".into(),

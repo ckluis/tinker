@@ -211,6 +211,7 @@ pub async fn setup() -> Env {
                     validation: Default::default(),
                     preset: None,
                     max_pii_class: "restricted".to_string(),
+                    sensitive: false,
                     name: label.to_string(),
                     api_name: api_name.to_string(),
                     label: label.to_string(),

@@ -327,6 +327,14 @@ fn resolve_policy_field(desc: &ObjectDescription, field: &str) -> Result<(String
             "row filter on evolved field '{field}' is not supported in v1"
         )));
     }
+    // A policy predicate on a sensitive field would compare the vault ref
+    // (meaningless) or need plaintext (forbidden): refuse at save and at
+    // compile time alike.
+    if f.sensitive {
+        return Err(TinkerError::Validation(format!(
+            "row filter on sensitive field '{field}' is not supported"
+        )));
+    }
     Ok((f.physical_column.clone(), f.field_type.clone()))
 }
 

@@ -18,8 +18,10 @@
 use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use tinker_core::blind_index::BlindIndexKey;
 use tinker_core::{Param, Result, TenantContext, TinkerError};
 use tinker_evolve::{ResolvedVersion, SchemaEvolver, VersionSel};
+use tinker_ontology::sensitive::MASK;
 use tinker_ontology::{FieldDescription, ObjectDescription, Ontology};
 use uuid::Uuid;
 
@@ -138,6 +140,9 @@ impl FieldProjection {
 pub struct QueryCompiler {
     ontology: Ontology,
     evolver: Option<SchemaEvolver>,
+    /// Keyed blind index for exact-match lookups on sensitive fields.
+    /// Absent: such lookups fail closed (docs/pii-sensitive-fields.md).
+    blind_index: Option<std::sync::Arc<BlindIndexKey>>,
 }
 
 impl QueryCompiler {
@@ -145,7 +150,15 @@ impl QueryCompiler {
         Self {
             ontology,
             evolver: None,
+            blind_index: None,
         }
+    }
+
+    /// Attach the blind-index key so `eq` / `ne` / `in` filters on
+    /// sensitive fields compile against their digest column.
+    pub fn with_blind_index(mut self, key: BlindIndexKey) -> Self {
+        self.blind_index = Some(std::sync::Arc::new(key));
+        self
     }
 
     /// Attach the M4 schema evolver. Without one, versioned queries fail
@@ -293,9 +306,19 @@ impl QueryCompiler {
             if !projection.allows(owner, &leaf) {
                 continue;
             }
-            let (expr, out) = self
+            let (mut expr, out) = self
                 .resolve_select(ctx, base, api_name, &mut joins, version_sel)
                 .await?;
+            // Sensitive fields read back masked: the plaintext never
+            // leaves the vault through a query (reveal is a separate,
+            // audited path), and caches only ever hold the mask.
+            if self
+                .sensitive_at(ctx, base, api_name, version_sel)
+                .await?
+                .is_some()
+            {
+                expr = format!("CASE WHEN {expr} IS NULL THEN NULL ELSE '{MASK}' END");
+            }
             select_cols.push((expr, out));
         }
         if select_cols.is_empty() {
@@ -307,14 +330,35 @@ impl QueryCompiler {
         // Pre-resolve filters and order exprs so every join they need
         // exists before the JOIN clause is rendered.
         let mut filter_exprs: Vec<(String, String)> = Vec::new();
+        let mut filters: Vec<Filter> = Vec::new();
         for f in &intent.filters {
             let (expr, kind) = self
                 .resolve_filter_field(ctx, base, &f.field, &mut joins, version_sel)
                 .await?;
-            filter_exprs.push((expr, kind));
+            match self.sensitive_at(ctx, base, &f.field, version_sel).await? {
+                Some(sf) => {
+                    let (expr, kind, eff) = self.sensitive_filter(ctx, &sf, &expr, f)?;
+                    filter_exprs.push((expr, kind));
+                    filters.push(eff);
+                }
+                None => {
+                    filter_exprs.push((expr, kind));
+                    filters.push(f.clone());
+                }
+            }
         }
         let mut order_exprs: Vec<String> = Vec::new();
         for o in &intent.order {
+            if self
+                .sensitive_at(ctx, base, &o.field, version_sel)
+                .await?
+                .is_some()
+            {
+                return Err(TinkerError::Validation(format!(
+                    "field '{}' is sensitive and cannot be sorted on",
+                    o.field
+                )));
+            }
             order_exprs.push(
                 self.resolve_order_field(ctx, base, &o.field, &mut joins, version_sel)
                     .await?,
@@ -391,7 +435,7 @@ impl QueryCompiler {
             &|n| format!("${n}"),
         );
 
-        for (f, (expr, kind)) in intent.filters.iter().zip(filter_exprs.iter()) {
+        for (f, (expr, kind)) in filters.iter().zip(filter_exprs.iter()) {
             push_predicate(&mut sql, &mut params, expr, kind, f, &|n| format!("${n}"))?;
         }
 
@@ -452,6 +496,102 @@ impl QueryCompiler {
     /// Describe a relation target with the target object's evolved fields
     /// for this version attached. Without an evolver (or for the active
     /// version with no evolution), this is the plain base description.
+    /// The field a select/filter/order path names, when it is sensitive.
+    async fn sensitive_at(
+        &self,
+        ctx: &TenantContext,
+        base: &ObjectDescription,
+        path: &str,
+        version_sel: VersionSel,
+    ) -> Result<Option<FieldDescription>> {
+        let field = match path.split_once('.') {
+            Some((rel_name, leaf)) => {
+                let Some(rel) = base
+                    .fields
+                    .iter()
+                    .find(|f| f.api_name == rel_name && f.field_type == "relation")
+                else {
+                    return Ok(None);
+                };
+                let target = self
+                    .describe_target(ctx, relation_target(rel)?, version_sel)
+                    .await?;
+                target.fields.into_iter().find(|f| f.api_name == leaf)
+            }
+            None => base.fields.iter().find(|f| f.api_name == path).cloned(),
+        };
+        Ok(field.filter(|f| f.sensitive))
+    }
+
+    /// Rewrite a filter on a sensitive field. Exact-match operators run
+    /// against the blind-index column with the value's digest; presence
+    /// checks run on the ref column; anything that would compare
+    /// plaintext (ranges, contains, prefixes) is refused.
+    fn sensitive_filter(
+        &self,
+        ctx: &TenantContext,
+        sf: &FieldDescription,
+        expr: &str,
+        f: &Filter,
+    ) -> Result<(String, String, Filter)> {
+        match f.op {
+            FilterOp::IsNull | FilterOp::IsNotNull => {
+                return Ok((expr.to_string(), "text".to_string(), f.clone()))
+            }
+            FilterOp::Eq | FilterOp::Ne | FilterOp::In => {}
+            _ => {
+                return Err(TinkerError::Validation(format!(
+                "field '{}' is sensitive: only eq, ne, in, is_null and is_not_null filters apply",
+                f.field
+            )))
+            }
+        }
+        let key = self.blind_index.as_ref().ok_or_else(|| {
+            TinkerError::Validation(format!(
+                "field '{}' is sensitive: lookups need TINKER_BLIND_INDEX_KEY on this server",
+                f.field
+            ))
+        })?;
+        let digest = |v: &serde_json::Value| -> Result<serde_json::Value> {
+            let s = v.as_str().ok_or_else(|| {
+                TinkerError::Validation(format!(
+                    "field '{}' is sensitive: filter values must be strings",
+                    f.field
+                ))
+            })?;
+            Ok(serde_json::Value::String(key.digest(
+                ctx.organization_id.0,
+                sf.id,
+                &sf.field_type,
+                s,
+            )))
+        };
+        let value = match (&f.op, &f.value) {
+            (FilterOp::In, serde_json::Value::Array(items)) => {
+                serde_json::Value::Array(items.iter().map(digest).collect::<Result<Vec<_>>>()?)
+            }
+            (FilterOp::In, _) => {
+                return Err(TinkerError::Validation(format!(
+                    "field '{}': in takes an array",
+                    f.field
+                )))
+            }
+            (_, v) => digest(v)?,
+        };
+        let phys = format!("\"{}\"", sf.physical_column);
+        let bidx = format!("\"{}\"", tinker_ontology::bidx_column(&sf.physical_column));
+        let bidx_expr = expr.replacen(&phys, &bidx, 1);
+        Ok((
+            bidx_expr,
+            "text".to_string(),
+            Filter {
+                field: f.field.clone(),
+                op: f.op,
+                value,
+            },
+        ))
+    }
+
     async fn describe_target(
         &self,
         ctx: &TenantContext,

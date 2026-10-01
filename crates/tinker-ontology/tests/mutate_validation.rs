@@ -129,6 +129,7 @@ fn field(
 ) -> FieldDef {
     FieldDef {
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
         validation,
         preset,
         name: api_name.into(),
@@ -275,6 +276,7 @@ fn desc(
         preset,
         required,
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
     }
 }
 

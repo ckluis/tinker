@@ -60,6 +60,10 @@ pub struct PackField {
     pub relation_target: Option<String>,
     #[serde(default)]
     pub required: bool,
+    /// Vault-backed field (docs/pii-sensitive-fields.md). Fixed at first
+    /// install: a reinstall that disagrees is drift and fails closed.
+    #[serde(default)]
+    pub sensitive: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -229,6 +233,7 @@ impl PackInstaller {
                                     validation: Default::default(),
                                     preset: None,
                                     max_pii_class: "restricted".to_string(),
+                                    sensitive: f.sensitive,
                                     name: f.name.clone(),
                                     api_name: f.api_name.clone(),
                                     label: f.label.clone(),
@@ -240,6 +245,15 @@ impl PackInstaller {
                             .await?;
                     }
                     Some(row) => {
+                        // The physical column differs (UUID ref vs value),
+                        // so a flipped flag is not a metadata repair.
+                        if row.sensitive != f.sensitive {
+                            return Err(TinkerError::Validation(format!(
+                                "pack field '{}' drifted: declared sensitive={} but installed \
+                                 sensitive={}; reinstall refuses to rewrite the column",
+                                f.api_name, f.sensitive, row.sensitive
+                            )));
+                        }
                         if row.name != f.name
                             || row.label != f.label
                             || row.required != f.required

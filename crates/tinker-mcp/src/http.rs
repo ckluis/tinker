@@ -69,7 +69,7 @@ use tinker_db::{CoreDb, OwnerDb};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use crate::{build_services, FrontDoor};
+use crate::{build_services_with_pii, FrontDoor};
 use tinker_ontology::lifecycle::LifecycleEngine;
 use tinker_ontology::mutate::MutationConnector;
 use tinker_web::SharedState;
@@ -559,8 +559,13 @@ pub async fn serve(bind: &str) -> Result<(), String> {
         .await
         .map_err(|e| format!("tenant db connect: {e}"))?;
 
+    // Sensitive fields: the PII vault from the environment. Unset → no
+    // vault (sensitive writes fail closed); partially set → startup error.
+    let pii = tinker_ontology::sensitive::sealer_from_env()
+        .await
+        .map_err(|e| format!("pii vault: {e}"))?;
     let (shared_state, mutator, lifecycle) =
-        build_services(core.0.clone(), owner.0.clone()).map_err(|e| e.to_string())?;
+        build_services_with_pii(core.0.clone(), owner.0.clone(), pii).map_err(|e| e.to_string())?;
     let sessions: Arc<RwLock<HashMap<String, Arc<Session>>>> =
         Arc::new(RwLock::new(HashMap::new()));
     tokio::spawn(sweep_loop(sessions.clone()));

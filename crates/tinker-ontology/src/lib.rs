@@ -21,6 +21,7 @@ pub mod lifecycle;
 /// invalidation/signal hooks — atomically coupled so no writer can take
 /// one without the others.
 pub mod mutate;
+pub mod sensitive;
 
 /// Item 37 (C3): decode validation rules from field metadata. A corrupt
 /// row fails closed: silently dropping enforcement would be worse than
@@ -56,6 +57,8 @@ type FieldRow = (
     bool,
     // Item 42 (C7): per-field ceiling for linked file PII classes.
     String,
+    // Vault-backed field (docs/pii-sensitive-fields.md).
+    bool,
 );
 
 // ---------------------------------------------------------------------------
@@ -162,6 +165,11 @@ pub struct FieldDef {
     /// keep working; validated at `add_field` time.
     #[serde(default = "default_max_pii_class")]
     pub max_pii_class: String,
+    /// Vault-backed field: values are sealed into the PII vault and
+    /// read back masked (docs/pii-sensitive-fields.md). Absent = false,
+    /// and false is never serialized, so existing payloads are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
 }
 
 /// Item 42 (C7): the permissive default — pre-item-42 field
@@ -250,6 +258,7 @@ pub struct PlatformFieldRow {
     pub required: bool,
     pub options_json: serde_json::Value,
     pub relation_target_id: Option<Uuid>,
+    pub sensitive: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -329,7 +338,30 @@ pub fn validate_field_def(def: &FieldDef) -> Result<()> {
         let _ = opts;
     }
     validate_validation_rules(def)?;
+    if def.sensitive {
+        if !matches!(
+            def.field_type,
+            FieldType::Text | FieldType::Email | FieldType::Phone
+        ) {
+            return Err(TinkerError::Validation(format!(
+                "field '{}': only text, email and phone fields can be sensitive",
+                def.api_name
+            )));
+        }
+        // A static preset would sit in plaintext in preset_json.
+        if def.preset.is_some() {
+            return Err(TinkerError::Validation(format!(
+                "field '{}': sensitive fields cannot carry a write preset",
+                def.api_name
+            )));
+        }
+    }
     Ok(())
+}
+
+/// The blind-index column that sits beside a sensitive field's ref column.
+pub fn bidx_column(physical_column: &str) -> String {
+    format!("{physical_column}__bidx")
 }
 
 /// Item 37 (C3): the validation rules themselves are validated at
@@ -752,7 +784,7 @@ impl Ontology {
     pub async fn platform_field_rows(&self, object_id: Uuid) -> Result<Vec<PlatformFieldRow>> {
         let rows = sqlx::query(
             "SELECT api_name, field_type, name, label, required, options_json, \
-             relation_target_id FROM ontology_fields \
+             relation_target_id, sensitive FROM ontology_fields \
              WHERE object_id=$1 AND state='active'",
         )
         .bind(object_id)
@@ -768,6 +800,7 @@ impl Ontology {
                 required: r.get("required"),
                 options_json: r.get("options_json"),
                 relation_target_id: r.get("relation_target_id"),
+                sensitive: r.get("sensitive"),
             })
             .collect())
     }
@@ -1144,11 +1177,30 @@ impl Ontology {
             );
         }
 
-        let alter = format!(
-            "ALTER TABLE {table} ADD COLUMN \"{physical}\" {}{check_sql}{fk_sql}",
-            def.field_type.pg_type(),
-        );
+        // Sensitive fields store the vault ref (UUID), never the value: a
+        // writer that skips sealing fails on the column type, and a reader
+        // that skips masking sees only an opaque id. The blind index sits
+        // in a sibling column for exact-match lookups.
+        let alter = if def.sensitive {
+            let bidx = bidx_column(&physical);
+            format!(
+                "ALTER TABLE {table} ADD COLUMN \"{physical}\" UUID, ADD COLUMN \"{bidx}\" TEXT"
+            )
+        } else {
+            format!(
+                "ALTER TABLE {table} ADD COLUMN \"{physical}\" {}{check_sql}{fk_sql}",
+                def.field_type.pg_type(),
+            )
+        };
         sqlx::query(&alter).execute(&mut *tx).await?;
+        if def.sensitive {
+            let bidx = bidx_column(&physical);
+            sqlx::query(&format!(
+                "CREATE INDEX \"{bidx}_idx\" ON {table} (organization_id, \"{bidx}\")"
+            ))
+            .execute(&mut *tx)
+            .await?;
+        }
 
         // Index relation columns: relation traversals are join-heavy.
         if matches!(def.field_type, FieldType::Relation { .. }) {
@@ -1186,8 +1238,8 @@ impl Ontology {
             r#"INSERT INTO ontology_fields
                (id, object_id, organization_id, physical_column, name, api_name,
                 label, field_type, options_json, relation_target_id, required,
-                validation_json, preset_json, max_pii_class)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)"#,
+                validation_json, preset_json, max_pii_class, sensitive)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)"#,
         )
         .bind(field_id)
         .bind(object_id)
@@ -1203,6 +1255,7 @@ impl Ontology {
         .bind(&validation_json)
         .bind(&preset_json)
         .bind(&max_pii_class)
+        .bind(def.sensitive)
         .execute(&mut *tx)
         .await
         .map_err(|e| match &e {
@@ -1219,7 +1272,7 @@ impl Ontology {
         )
         .bind(field_org)
         .bind(object_id)
-        .bind(serde_json::json!({"api_name": def.api_name, "physical_column": physical, "type": type_name}))
+        .bind(serde_json::json!({"api_name": def.api_name, "physical_column": physical, "type": type_name, "sensitive": def.sensitive}))
         .bind(vec![alter.clone()])
         .bind(applied_by)
         .execute(&mut *tx)
@@ -1284,7 +1337,7 @@ impl Ontology {
         let fields: Vec<FieldRow> = if let Some(source) = adopted_from {
             sqlx::query_as(
                 "SELECT id, physical_column, api_name, label, field_type, options_json, relation_target_id, \
-                 validation_json, preset_json, required, max_pii_class \
+                 validation_json, preset_json, required, max_pii_class, sensitive \
                  FROM ontology_fields WHERE (object_id=$1 OR object_id=$2) AND state='active' ORDER BY created_at",
             )
             .bind(object_id)
@@ -1294,7 +1347,7 @@ impl Ontology {
         } else {
             sqlx::query_as(
                 "SELECT id, physical_column, api_name, label, field_type, options_json, relation_target_id, \
-                 validation_json, preset_json, required, max_pii_class \
+                 validation_json, preset_json, required, max_pii_class, sensitive \
                  FROM ontology_fields WHERE object_id=$1 AND state='active' ORDER BY created_at",
             )
             .bind(object_id)
@@ -1318,6 +1371,7 @@ impl Ontology {
             preset_json,
             required,
             max_pii_class,
+            sensitive,
         ) in fields
         {
             out.push(FieldDescription {
@@ -1343,6 +1397,7 @@ impl Ontology {
                         )))
                     }
                 },
+                sensitive,
             });
         }
         // Item 39 (C4): adopted objects inherit base field rows from the
@@ -1464,6 +1519,7 @@ impl Ontology {
                 // skipped on write by the mutation connector, so the PII
                 // ceiling never enforces here; keep the permissive default.
                 max_pii_class: "restricted".to_string(),
+                sensitive: false,
             });
         }
         Ok(desc)
@@ -1561,6 +1617,9 @@ pub struct FieldDescription {
     /// exceeds this ceiling, fail closed. Only enforced for `file`
     /// fields; stored for all fields for uniformity.
     pub max_pii_class: String,
+    /// Vault-backed field: values are sealed into the PII vault and
+    /// read back masked (docs/pii-sensitive-fields.md).
+    pub sensitive: bool,
 }
 
 /// M4: a field added by schema evolution, resolved from immutable version

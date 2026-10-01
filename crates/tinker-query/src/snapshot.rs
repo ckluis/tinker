@@ -144,6 +144,11 @@ pub struct FieldSnapshot {
     /// writes it, so round-trips preserve the operator's setting).
     #[serde(default = "default_max_pii_class")]
     pub max_pii_class: String,
+    /// Vault-backed field: values are sealed into the PII vault and
+    /// read back masked (docs/pii-sensitive-fields.md). Absent = false,
+    /// and false is never serialized, so existing payloads are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
 }
 
 /// Item 42 (C7): pre-item-42 snapshots carry no PII ceiling; the
@@ -961,6 +966,7 @@ impl SnapshotService {
                 preset: f.preset.clone(),
                 // Item 42 (C7): always exported, so re-apply preserves it.
                 max_pii_class: f.max_pii_class.clone(),
+                sensitive: f.sensitive,
             });
         }
         fields.sort_by(|a, b| a.api_name.cmp(&b.api_name));
@@ -1560,6 +1566,7 @@ impl SnapshotService {
             // Item 42 (C7): validated by add_field; a corrupt value fails
             // the apply, never lands permissive.
             max_pii_class: f.max_pii_class.clone(),
+            sensitive: f.sensitive,
         })
     }
 }

@@ -54,6 +54,7 @@ fn object_def(slug: &str) -> ObjectDef {
 fn field(api_name: &str, field_type: FieldType) -> FieldDef {
     FieldDef {
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
         validation: ValidationRules::default(),
         preset: None,
         name: api_name.into(),
@@ -68,6 +69,7 @@ fn field(api_name: &str, field_type: FieldType) -> FieldDef {
 fn snap_field(api_name: &str, kind: &str) -> FieldSnapshot {
     FieldSnapshot {
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
         api_name: api_name.into(),
         label: format!("{api_name} label"),
         kind: kind.into(),
@@ -1120,6 +1122,7 @@ async fn diff_and_human_rendering() {
         validation: ValidationRules::default(),
         preset: None,
         max_pii_class: "restricted".to_string(),
+        sensitive: false,
     });
     let amount = deal
         .fields

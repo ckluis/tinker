@@ -151,6 +151,11 @@ pub struct DescribedField {
     pub preset: Option<tinker_ontology::WritePreset>,
     /// Item 42: ceiling for PII classes of linked files.
     pub max_pii_class: String,
+    /// Vault-backed field: values are sealed into the PII vault and
+    /// read back masked (docs/pii-sensitive-fields.md). Absent = false,
+    /// and false is never serialized, so existing payloads are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
     /// Target object slug for relation fields, resolved live.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relation_target: Option<String>,
@@ -388,6 +393,7 @@ impl Describer {
                 validation: f.validation.clone(),
                 preset: f.preset.clone(),
                 max_pii_class: f.max_pii_class.clone(),
+                sensitive: f.sensitive,
                 relation_target,
             });
         }
@@ -648,6 +654,11 @@ fn describe_reads() -> ReadContract {
                 .to_string(),
             "query plans are cached per (organization, plan hash); the hash covers the row-policy \
              SQL and actor binds, so roles never share an unauthorized plan"
+                .to_string(),
+            "fields marked sensitive read back as \"••••••\" (null when empty) on every read path; \
+             filter them only with eq/ne/in (exact match on the normalized value) or is_null/is_not_null, \
+             never sort on them; the plaintext comes only from the `reveal` tool (owner/admin, \
+             explicit mcp:tool:reveal scope, audited with a purpose)"
                 .to_string(),
         ],
     }

@@ -1035,6 +1035,15 @@ fn validate_evo_field_def(def: &FieldDef) -> Result<()> {
     if def.label.trim().is_empty() {
         return Err(TinkerError::Validation("field label is required".into()));
     }
+    // Evolved fields live in ext tables the vault path does not cover
+    // (docs/pii-sensitive-fields.md, "Not in v1"): refuse, never store a
+    // "sensitive" value in plaintext.
+    if def.sensitive {
+        return Err(TinkerError::Validation(format!(
+            "field '{}': sensitive fields must be defined on the base object, not evolved",
+            def.api_name
+        )));
+    }
     if let FieldType::Select = def.field_type {
         let ok = def
             .options

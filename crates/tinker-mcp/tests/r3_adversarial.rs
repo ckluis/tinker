@@ -133,6 +133,7 @@ fn text_field(api_name: &str, required: bool) -> FieldDef {
         validation: ValidationRules::default(),
         preset: None,
         max_pii_class: "none".into(),
+        sensitive: false,
     }
 }
 

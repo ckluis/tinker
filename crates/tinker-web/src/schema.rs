@@ -115,6 +115,11 @@ pub struct FieldInput {
     /// `file` field. Defaults to 'restricted' (permissive).
     #[serde(default = "default_max_pii_class")]
     pub max_pii_class: String,
+    /// Vault-backed field: values are sealed into the PII vault and
+    /// read back masked (docs/pii-sensitive-fields.md). Absent = false,
+    /// and false is never serialized, so existing payloads are unchanged.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sensitive: bool,
 }
 
 /// Item 42 (C7): mirrors the ontology default — fields defined without
@@ -167,6 +172,7 @@ pub(crate) fn field_def_from(input: FieldInput, relation: bool) -> Result<FieldD
         // Item 42 (C7): PII ceiling comes from the client payload;
         // add_field validates the vocabulary.
         max_pii_class: input.max_pii_class,
+        sensitive: input.sensitive,
         name: input.name,
         api_name: input.api_name,
         label: input.label,

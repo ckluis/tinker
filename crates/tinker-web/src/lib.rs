@@ -90,6 +90,10 @@ pub struct AppState {
     /// Owner pool for RLS-blind metadata lookups (thread id -> org id).
     /// Never serves tenant content reads.
     pub owner: tinker_db::OwnerDb,
+    /// PII vault + blind-index key for sensitive fields
+    /// (docs/pii-sensitive-fields.md). `None`: sensitive writes, lookups
+    /// and reveals fail closed.
+    pub pii: Option<tinker_ontology::sensitive::PiiSealer>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -514,6 +518,27 @@ pub fn build_state(
     host_name: String,
     cookie_secure: bool,
 ) -> SharedState {
+    build_state_with_pii(
+        tenant_pool,
+        system_pool,
+        broker,
+        host_name,
+        cookie_secure,
+        None,
+    )
+}
+
+/// [`build_state`] with the PII vault attached: the compiler gets the
+/// blind-index key for sensitive lookups, and `state.pii` carries the
+/// sealer for write paths and reveal.
+pub fn build_state_with_pii(
+    tenant_pool: PgPool,
+    system_pool: PgPool,
+    broker: AuthBroker,
+    host_name: String,
+    cookie_secure: bool,
+    pii: Option<tinker_ontology::sensitive::PiiSealer>,
+) -> SharedState {
     let core = tinker_db::CoreDb(tenant_pool.clone());
     let owner = tinker_db::OwnerDb(system_pool.clone());
     let signals = SignalBus::new();
@@ -528,7 +553,11 @@ pub fn build_state(
     let compiler = {
         let evolver =
             tinker_evolve::SchemaEvolver::new(core.clone(), owner.clone(), ontology.clone());
-        QueryCompiler::new(ontology.clone()).with_evolver(evolver)
+        let compiler = QueryCompiler::new(ontology.clone()).with_evolver(evolver);
+        match &pii {
+            Some(p) => compiler.with_blind_index(p.blind_index().clone()),
+            None => compiler,
+        }
     };
     Arc::new(AppState {
         sessions: SessionManager::new(tenant_pool.clone(), system_pool.clone()),
@@ -553,5 +582,6 @@ pub fn build_state(
         // Platform DDL runs separately via `Comms::install`.
         comms: tinker_comms::Comms::new(core, ontology, signals),
         owner: tinker_db::OwnerDb(system_pool),
+        pii,
     })
 }
