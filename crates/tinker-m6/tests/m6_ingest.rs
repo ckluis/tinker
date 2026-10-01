@@ -2512,3 +2512,209 @@ async fn snapshot_cursor_marks_missing_as_deleted() {
         "canonical rows are not removed by the mirror sweep"
     );
 }
+
+/// Sensitive canonical fields (docs/pii-sensitive-fields.md) through
+/// managed ingestion: promotion seals the value into the vault, matches
+/// identities and runs survivorship on the blind index, records only the
+/// digest as provenance, and scrubs the landing mirror to a digest
+/// marker. A re-run is a no-op: no re-seal, no plaintext reappears.
+#[tokio::test]
+async fn ingest_seals_sensitive_fields_and_scrubs_landing() {
+    let env = setup().await;
+    let tag = &uuid::Uuid::now_v7().simple().to_string()[20..32];
+    let slug = format!("pii_lead_{tag}");
+    let pack = tinker_packs::PackDefinition::from_toml(&format!(
+        "[pack]\nid = \"pii-lead-{tag}\"\nversion = \"1.0.0\"\nname = \"Leads\"\n\n\
+         [[objects]]\nname = \"Lead\"\napi_slug = \"{slug}\"\nlabel = \"Lead\"\n\n\
+         [[objects.fields]]\nname = \"name\"\napi_name = \"name\"\nlabel = \"Name\"\nfield_type = \"text\"\n\n\
+         [[objects.fields]]\nname = \"email\"\napi_name = \"email\"\nlabel = \"Email\"\n\
+         field_type = \"email\"\nsensitive = true\n"
+    ))
+    .unwrap();
+    tinker_packs::PackInstaller::new(
+        tinker_ontology::Ontology::new(env.core.clone(), env.owner.clone()),
+        tinker_apps::AppRegistry::new(env.core.0.clone()),
+    )
+    .install_objects(&pack)
+    .await
+    .unwrap();
+    let sealer = tinker_ontology::sensitive::sealer_from_env()
+        .await
+        .unwrap()
+        .expect("TINKER_PII_URL, TINKER_KEK, TINKER_BLIND_INDEX_KEY must be set");
+    let pipeline = tinker_ingest::IngestPipeline::new(env.core.clone(), env.owner.clone())
+        .with_pii(sealer.clone());
+
+    let source = format!("Lead{tag}");
+    env.salesforce.seed_object(
+        &source,
+        vec![
+            tinker_ingest::SourceField {
+                name: "Id".into(),
+                type_name: "id".into(),
+            },
+            tinker_ingest::SourceField {
+                name: "FullName".into(),
+                type_name: "string".into(),
+            },
+            tinker_ingest::SourceField {
+                name: "Email".into(),
+                type_name: "string".into(),
+            },
+        ],
+        vec![tinker_ingest::SourceRecord {
+            source_id: "LEAD-1".into(),
+            updated_at: "2026-09-20T10:00:00Z".parse().unwrap(),
+            deleted: false,
+            fields: [
+                ("Id".to_string(), serde_json::json!("LEAD-1")),
+                ("FullName".to_string(), serde_json::json!("Grace Hopper")),
+                (
+                    "Email".to_string(),
+                    serde_json::json!("Grace.Hopper@Navy.mil"),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        }],
+    );
+    let control = pipeline.control();
+    let conn = control
+        .create_connection(
+            &env.ctx,
+            tinker_ingest::control::NewConnection {
+                kind: "salesforce".into(),
+                name: "salesforce".into(),
+                credential_ref: None,
+            },
+        )
+        .await
+        .unwrap();
+    let stream = control
+        .create_stream(
+            &env.ctx,
+            tinker_ingest::control::NewStream {
+                connection_id: conn.id,
+                source_object: source.clone(),
+                cursor_kind: "updated_at".into(),
+            },
+        )
+        .await
+        .unwrap();
+    for (src, tgt) in [("FullName", "name"), ("Email", "email")] {
+        pipeline
+            .mappings()
+            .put_mapping(&env.ctx, stream.id, src, &slug, tgt)
+            .await
+            .unwrap();
+    }
+    let target = tinker_ingest::pipeline::CanonicalTarget {
+        object_slug: slug.clone(),
+        email_api_field: Some("email".into()),
+    };
+    let run = |mode| {
+        let pipeline = &pipeline;
+        let env = &env;
+        let target = target.clone();
+        async move {
+            pipeline
+                .run(&env.ctx, &env.salesforce, stream.id, &[target], 2, mode)
+                .await
+                .unwrap()
+        }
+    };
+    run(RunMode::Incremental).await;
+
+    // Canonical row: ref + digest, no plaintext; reveal round-trips.
+    let mut tx = env.core.tenant_tx(&env.ctx).await.unwrap();
+    let rows: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT to_jsonb(t)::text FROM data.{slug} t WHERE organization_id = $1"
+    ))
+    .bind(env.org_id)
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        rows[0].contains("Grace Hopper"),
+        "non-sensitive lands as-is"
+    );
+    assert!(!rows[0].to_lowercase().contains("navy.mil"), "{}", rows[0]);
+    let landing: Vec<String> = sqlx::query_scalar(&format!(
+        "SELECT to_jsonb(t)::text FROM {} t WHERE organization_id = $1",
+        tinker_ingest::LandingWriter::table_for(stream.id)
+    ))
+    .bind(env.org_id)
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert!(
+        !landing[0].to_lowercase().contains("navy.mil"),
+        "landing scrubbed: {}",
+        landing[0]
+    );
+    assert!(landing[0].contains("$tinker_sealed"), "{}", landing[0]);
+    let prov: Vec<String> = sqlx::query_scalar(
+        "SELECT value::text FROM ingest_provenance WHERE organization_id = $1 AND field = 'email'",
+    )
+    .bind(env.org_id)
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(prov.len(), 1);
+    assert!(
+        !prov[0].to_lowercase().contains("navy"),
+        "provenance holds the digest: {}",
+        prov[0]
+    );
+    let email_col: String = sqlx::query_scalar(
+        "SELECT f.physical_column FROM ontology_fields f JOIN ontology_objects o ON o.id = f.object_id \
+         WHERE o.api_slug = $1 AND f.api_name = 'email'",
+    )
+    .bind(&slug)
+    .fetch_one(&env.owner.0)
+    .await
+    .unwrap();
+    let ref_id: uuid::Uuid = sqlx::query_scalar(&format!(
+        "SELECT \"{email_col}\" FROM data.{slug} WHERE organization_id = $1"
+    ))
+    .bind(env.org_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    let refs_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pii_refs WHERE organization_id = $1")
+            .bind(env.org_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        sealer
+            .reveal(&env.core, &env.ctx, ref_id, "ingest test")
+            .await
+            .unwrap(),
+        "Grace.Hopper@Navy.mil"
+    );
+
+    // Full resync: the scrubbed landing row compares by digest — nothing
+    // is re-sealed and the canonical ref is unchanged.
+    run(RunMode::FullResync).await;
+    let mut tx = env.core.tenant_tx(&env.ctx).await.unwrap();
+    let refs_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pii_refs WHERE organization_id = $1")
+            .bind(env.org_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    let ref_after: uuid::Uuid = sqlx::query_scalar(&format!(
+        "SELECT \"{email_col}\" FROM data.{slug} WHERE organization_id = $1"
+    ))
+    .bind(env.org_id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(refs_after, refs_before, "no re-seal on an unchanged value");
+    assert_eq!(ref_after, ref_id);
+}

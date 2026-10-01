@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 use tinker_core::{Result, TenantContext, TinkerError};
 use tinker_db::{CoreDb, OwnerDb};
+use tinker_ontology::sensitive::{register_refs, PiiSealer, SealedRef};
 use uuid::Uuid;
 
 use crate::connector::SourceConnector;
@@ -59,6 +60,11 @@ pub struct TypedField {
     /// Ontology kind name: text, email, number, currency, boolean, date,
     /// datetime, select, multi_select, richtext, relation, phone, url, file.
     pub kind: String,
+    /// `ontology_fields.id` — scopes the blind index of a sensitive field.
+    pub field_id: Uuid,
+    /// Vault-backed field (docs/pii-sensitive-fields.md): promotion seals
+    /// the value, compares by blind index, and scrubs landing.
+    pub sensitive: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -165,6 +171,28 @@ impl TypedBind {
 /// Convert a JSON value to a typed bind for an ontology field kind.
 /// Unconvertible values are a [`TinkerError::Validation`] — the caller
 /// turns those into conflict review items, never silent drops.
+/// Landing marker for a sensitive source value that has been promoted:
+/// the plaintext is replaced by its blind-index digest.
+const SEALED_MARKER: &str = "$tinker_sealed";
+
+fn sealed_marker(digest: &str) -> serde_json::Value {
+    serde_json::json!({ SEALED_MARKER: digest })
+}
+
+fn marker_digest(v: &serde_json::Value) -> Option<&str> {
+    let m = v.as_object().filter(|m| m.len() == 1)?;
+    m.get(SEALED_MARKER)?.as_str()
+}
+
+fn winners_or_proposal_digest(proposals: &[FieldProposal], field: &str) -> String {
+    proposals
+        .iter()
+        .find(|p| p.field == field)
+        .and_then(|p| p.value.as_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn to_typed_bind(kind: &str, v: &serde_json::Value) -> Result<TypedBind> {
     if v.is_null() {
         return Ok(match kind {
@@ -262,6 +290,7 @@ pub struct IngestPipeline {
     mappings: MappingEngine,
     identity: IdentityEngine,
     survivorship: Survivorship,
+    pii: Option<PiiSealer>,
 }
 
 /// How a run treats the stream's durable checkpoint.
@@ -287,7 +316,15 @@ impl IngestPipeline {
             mappings: MappingEngine::new(core.clone(), owner),
             identity: IdentityEngine::new(core.clone()),
             survivorship: Survivorship::new(core),
+            pii: None,
         }
+    }
+
+    /// Attach the PII vault so streams can promote into sensitive fields.
+    /// Without it, a sensitive value fails closed as a conflict review.
+    pub fn with_pii(mut self, sealer: PiiSealer) -> Self {
+        self.pii = Some(sealer);
+        self
     }
 
     pub fn control(&self) -> &IngestControl {
@@ -335,8 +372,8 @@ impl IngestPipeline {
         // interpolated into SQL below.
         let table = format!("data.{slug}");
         ident::data_table(&table)?;
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT api_name, physical_column, field_type FROM ontology_fields
+        let rows: Vec<(String, String, String, Uuid, bool)> = sqlx::query_as(
+            "SELECT api_name, physical_column, field_type, id, sensitive FROM ontology_fields
              WHERE object_id=$1 AND state='active'",
         )
         .bind(object_id)
@@ -344,7 +381,7 @@ impl IngestPipeline {
         .await
         .map_err(TinkerError::Db)?;
         let mut fields = HashMap::new();
-        for (api_name, physical, kind) in rows {
+        for (api_name, physical, kind, field_id, sensitive) in rows {
             ident::ident("physical_column", &physical)?;
             fields.insert(
                 api_name.clone(),
@@ -352,6 +389,8 @@ impl IngestPipeline {
                     api_name,
                     physical,
                     kind,
+                    field_id,
+                    sensitive,
                 },
             );
         }
@@ -1041,6 +1080,10 @@ impl IngestPipeline {
         // Typed proposals; unconvertible values become conflict
         // review items (never silent drops, never poisoned runs).
         let mut proposals: Vec<FieldProposal> = vec![];
+        // Sensitive fields (docs/pii-sensitive-fields.md): survivorship
+        // runs on blind-index digests; the plaintext stays in this map
+        // only until it is sealed, then landing is scrubbed to a marker.
+        let mut plaintext: HashMap<String, String> = HashMap::new();
         for (obj, api_field, value) in triples {
             if *obj != target.object_slug {
                 continue;
@@ -1056,6 +1099,41 @@ impl IngestPipeline {
                 .find(|m| m.target_object == *obj && m.target_field == *api_field)
                 .map(|m| m.source_field.clone())
                 .unwrap_or_default();
+            if tf.sensitive {
+                let digest = if let Some(d) = marker_digest(value) {
+                    Some(d.to_string())
+                } else if value.is_null() {
+                    None
+                } else if let (Some(s), Some(p)) = (value.as_str(), &self.pii) {
+                    plaintext.insert(api_field.clone(), s.to_string());
+                    Some(
+                        p.blind_index()
+                            .digest(ctx.organization_id.0, tf.field_id, &tf.kind, s),
+                    )
+                } else {
+                    // Never echo the value: the review item names the
+                    // field and the rule only.
+                    let why = if self.pii.is_none() {
+                        "sensitive field, but this pipeline has no PII vault configured"
+                    } else {
+                        "sensitive fields take a string value (value withheld)"
+                    };
+                    self.queue_conflict_review_tx(
+                        &mut tx, ctx, stream_id, source_id, api_field, why,
+                    )
+                    .await?;
+                    continue;
+                };
+                proposals.push(FieldProposal {
+                    field: api_field.clone(),
+                    value: digest.map(serde_json::Value::String).unwrap_or_default(),
+                    priority: 0,
+                    stream_id,
+                    source_id: source_id.to_string(),
+                    source_field,
+                });
+                continue;
+            }
             match to_typed_bind(&tf.kind, value) {
                 Ok(bind) => proposals.push(FieldProposal {
                     field: api_field.clone(),
@@ -1084,12 +1162,35 @@ impl IngestPipeline {
         let winners = Survivorship::winners(&proposals, &current);
         let mut promoted = 0u64;
         if !winners.is_empty() {
-            self.write_canonical_tx(&mut tx, ctx, target, record_id, &winners)
+            self.write_canonical_tx(&mut tx, ctx, target, record_id, &winners, &plaintext)
                 .await?;
             self.survivorship
                 .record_provenance_tx(&mut tx, ctx, record_id, &winners)
                 .await?;
             promoted = 1;
+        }
+        // Landing kept the source plaintext only until promotion: replace
+        // each promoted sensitive value with its digest marker, in the
+        // same transaction as the sealed write.
+        for api_field in plaintext.keys() {
+            let Some(m) = mappings
+                .iter()
+                .find(|m| m.target_object == target.object_slug && m.target_field == *api_field)
+            else {
+                continue;
+            };
+            let digest = winners_or_proposal_digest(&proposals, api_field);
+            ident::ident("landing field", &m.source_field)?;
+            sqlx::query(&format!(
+                "UPDATE {} SET \"{}\" = $3 WHERE organization_id = $1 AND _source_id = $2",
+                LandingWriter::table_for(stream_id),
+                m.source_field
+            ))
+            .bind(ctx.organization_id.0)
+            .bind(source_id)
+            .bind(sealed_marker(&digest))
+            .execute(&mut *tx)
+            .await?;
         }
         tx.commit().await?;
         let promote_millis = t_promote.elapsed().as_millis() as u64;
@@ -1125,13 +1226,30 @@ impl IngestPipeline {
             });
         }
         if let (Some(phys), Some(email)) = (&target.email_physical, email) {
-            if !email.trim().is_empty() {
+            let email_field = target.email_api.as_ref().and_then(|a| target.fields.get(a));
+            // A sensitive email matches on its blind index (the column
+            // holds a vault ref); without a vault there is nothing to
+            // match against, so only the identity-link registry applies.
+            let lookup = match email_field.filter(|f| f.sensitive) {
+                Some(f) => self.pii.as_ref().map(|p| {
+                    (
+                        format!("\"{}\" = $2", tinker_ontology::bidx_column(phys)),
+                        p.blind_index()
+                            .digest(ctx.organization_id.0, f.field_id, &f.kind, email),
+                    )
+                }),
+                None => Some((
+                    format!("lower(\"{phys}\"::text)=lower($2)"),
+                    email.to_string(),
+                )),
+            };
+            if let (false, Some((pred, bind))) = (email.trim().is_empty(), lookup) {
                 let rows: Vec<(Uuid,)> = sqlx::query_as(&format!(
-                    "SELECT id FROM {} WHERE organization_id=$1 AND lower(\"{}\"::text)=lower($2)",
-                    target.table, phys
+                    "SELECT id FROM {} WHERE organization_id=$1 AND {pred}",
+                    target.table
                 ))
                 .bind(ctx.organization_id.0)
-                .bind(email)
+                .bind(bind)
                 .fetch_all(&mut **tx)
                 .await?;
                 for (id,) in rows {
@@ -1192,9 +1310,16 @@ impl IngestPipeline {
         if cols.is_empty() {
             return Ok(out);
         }
+        // Sensitive fields compare by blind index, never by value.
         let select = cols
             .iter()
-            .map(|(_, tf)| format!("\"{}\"::text", tf.physical))
+            .map(|(_, tf)| {
+                if tf.sensitive {
+                    format!("\"{}\"::text", tinker_ontology::bidx_column(&tf.physical))
+                } else {
+                    format!("\"{}\"::text", tf.physical)
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
         let row: Option<sqlx::postgres::PgRow> = sqlx::query(&format!(
@@ -1208,7 +1333,12 @@ impl IngestPipeline {
         if let Some(row) = row {
             for (i, (api, tf)) in cols.iter().enumerate() {
                 let raw: Option<String> = row.try_get(i).unwrap_or(None);
-                if let Some(json) = text_to_json(&tf.kind, raw) {
+                let kind = if tf.sensitive {
+                    "text"
+                } else {
+                    tf.kind.as_str()
+                };
+                if let Some(json) = text_to_json(kind, raw) {
                     out.insert((*api).clone(), json);
                 }
             }
@@ -1225,6 +1355,7 @@ impl IngestPipeline {
         target: &ResolvedTarget,
         record_id: Uuid,
         winners: &[FieldProposal],
+        plaintext: &HashMap<String, String>,
     ) -> Result<()> {
         for w in winners {
             let tf = target.fields.get(&w.field).ok_or_else(|| {
@@ -1233,6 +1364,46 @@ impl IngestPipeline {
                     w.field, target.object_slug
                 ))
             })?;
+            if tf.sensitive {
+                // A digest without plaintext came from a scrubbed landing
+                // row while the canonical value moved on elsewhere: there
+                // is nothing to seal, so the canonical value stands.
+                let Some(value) = plaintext.get(&w.field) else {
+                    continue;
+                };
+                let sealer = self.pii.as_ref().ok_or_else(|| {
+                    TinkerError::Validation(format!(
+                        "field '{}' is sensitive, but this pipeline has no PII vault configured",
+                        w.field
+                    ))
+                })?;
+                let class = format!("pii.{}", w.field);
+                let ref_id = sealer.vault().seal(ctx, record_id, &class, value).await?;
+                register_refs(
+                    tx,
+                    ctx,
+                    &[SealedRef {
+                        ref_id,
+                        subject: record_id,
+                        storage_class: class,
+                    }],
+                )
+                .await?;
+                sqlx::query(&format!(
+                    "UPDATE {} SET \"{}\" = $3, \"{}\" = $4, version = version + 1, updated_at = now()
+                     WHERE organization_id = $1 AND id = $2",
+                    target.table,
+                    tf.physical,
+                    tinker_ontology::bidx_column(&tf.physical)
+                ))
+                .bind(ctx.organization_id.0)
+                .bind(record_id)
+                .bind(ref_id)
+                .bind(w.value.as_str())
+                .execute(&mut **tx)
+                .await?;
+                continue;
+            }
             let bind = to_typed_bind(&tf.kind, &w.value)?;
             let cast = bind_cast(&tf.kind);
             let sql = format!(
