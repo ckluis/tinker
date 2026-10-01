@@ -4,7 +4,9 @@
 # systemd unit in this directory owns the postmaster.
 
 ## 0. Prerequisites (operator provides)
-- PostgreSQL 16 server binaries (`postgresql-16`).
+- PostgreSQL 18 server binaries (`postgresql-18` from the PGDG apt
+  repository, apt.postgresql.org; Ubuntu 24.04's own archive stops at 16).
+  Upgrading an existing 16 cluster: see §7.
 - A persistent data volume mounted at `/var/lib/postgresql` (or any
   persistent path — adjust `PGDATA` below and in the systemd unit).
 - The WAL archive spool directory's parent on persistent disk.
@@ -15,11 +17,14 @@
 
 ## 1. initdb
 ```sh
-PGDATA=/var/lib/postgresql/16/prod
-PGBIN=/usr/lib/postgresql/16/bin
+PGDATA=/var/lib/postgresql/18/prod
+PGBIN=/usr/lib/postgresql/18/bin
 install -d -o postgres -g postgres -m 0700 "$PGDATA"
 su -s /bin/sh postgres -c "umask 077; $PGBIN/initdb -D '$PGDATA' -E UTF8 \
   --locale=C.UTF-8 --auth=scram-sha-256"
+# PostgreSQL 18 initdb enables data checksums by default (wanted for a
+# fresh cluster). An upgrade from a 16 cluster that lacks them must
+# instead initdb with --no-data-checksums — see §7.
 # The superuser password is set interactively or via --pwfile from the
 # operator's secret store. It is NEVER committed to the repo.
 ```
@@ -102,7 +107,8 @@ $PGBIN/psql -h /var/run/postgresql -d tinker_core -v ON_ERROR_STOP=1 -q \
 ```
 The block is idempotent: re-running converges passwords and grants
 instead of duplicating them. Validated 2026-09-28 on a scratch PG16
-cluster: all four roles created with the documented attributes
+cluster (re-run 2026-09-30 against PG 18.6 by bin/dev-db-mac.sh, which
+mirrors this block): all four roles created with the documented attributes
 (login; CREATEROLE on owners only; NOSUPERUSER), SCRAM password login
 verified over TCP for each role, wrong password rejected, and a second
 run with a rotated password converged to the new password.
@@ -131,3 +137,31 @@ psql "$TINKER_CORE_OWNER_URL" -tAc \
 ```
 `last_failed_wal` non-empty (or `failed_count` rising) is a
 page-the-operator condition — archiving is the RPO story.
+
+## 7. Upgrading an existing PostgreSQL 16 cluster to 18
+Tinker's schema needs nothing version-specific: every core and PII
+migration, pgcrypto and pg_trgm apply unchanged on 18 (full workspace
+suite green on 18.6, 2026-09-30). The upgrade is a cluster operation:
+
+1. Take a fresh base backup and verify it restores (R2 runbook) — the
+   upgrade's rollback is that backup.
+2. Install `postgresql-18` alongside 16. Stop `tinker-mcp` (all
+   instances), then `tinker-postgres`.
+3. `initdb` the new cluster as in §1, adding `--no-data-checksums`
+   if `pg_controldata $OLD_PGDATA | grep checksum` shows version 0 —
+   pg_upgrade refuses a checksum mismatch. Copy `postgresql.conf` (§2).
+4. Skip §3–§4 for the new cluster: pg_upgrade carries roles,
+   databases, grants and extensions across. Run, as postgres:
+   ```sh
+   /usr/lib/postgresql/18/bin/pg_upgrade --check \
+     -b /usr/lib/postgresql/16/bin -B /usr/lib/postgresql/18/bin \
+     -d /var/lib/postgresql/16/prod -D /var/lib/postgresql/18/prod
+   ```
+   then the same command without `--check` (add `--link` only if the
+   backup in step 1 is verified: link mode makes the old cluster
+   unusable once the new one starts).
+5. Point the systemd unit at the 18 paths (this repo's unit already
+   does), start it, `vacuumdb --all --analyze-in-stages` (pg_upgrade
+   does not carry planner statistics), then start `tinker-mcp`.
+6. Verify: §5 migration count, §6 archiving, and a `/healthz` probe.
+

@@ -10,7 +10,7 @@
 ## 1. System overview (what is being defended)
 
 Tinker is a single-binary Rust workspace (`tinker-mcp serve`, `tinker-cli`)
-backed by one PostgreSQL 16 database (core + PII vault) and Redis. The
+backed by one PostgreSQL 18 database (core + PII vault) and Redis. The
 security-relevant surfaces reviewed:
 
 | Surface | Entry | Auth |

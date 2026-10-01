@@ -10,7 +10,7 @@
   a rootfs roll. That is *intentional* in dev: the database is
   disposable and test fixtures re-seed it.
 - PROD: a PERSISTENT directory on real disk, e.g.
-  `/var/lib/postgresql/16/prod` (see initdb-and-bootstrap.md). The
+  `/var/lib/postgresql/18/prod` (see initdb-and-bootstrap.md). The
   postgres OS user must own it; it must be on a volume that survives
   reboots, and it must be included in the host backup (point at the R2
   DR runbook for the backup/restore procedure).

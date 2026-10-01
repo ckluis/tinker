@@ -40,7 +40,8 @@ deploy/
 
 1. **Host + OS user**: provision the machine (see "What you must
    provide"), create the `tinker` and `redis` OS users, install
-   PostgreSQL 16 and Redis 7 (vendored debs live in
+   PostgreSQL 18 (PGDG apt repo, apt.postgresql.org — Ubuntu 24.04 main
+   ships only 16) and Redis 7 (vendored Redis debs live in
    `bin/vendor/` if the host is offline).
 2. **PostgreSQL**: follow `postgres/initdb-and-bootstrap.md`
    (initdb → `postgresql.conf` → archive spool → one-shot role/DB/
