@@ -495,13 +495,15 @@ impl<'a> Parser<'a> {
             }
             let rest = self.rest();
             if rest.starts_with("{{") {
-                let end = rest.find("}}").ok_or(RenderError::UnclosedTag)?;
+                // Search for the closer AFTER the opener: `{{}` must not
+                // match its own braces (that sliced `[2..1]` and panicked).
+                let end = close_after_opener(rest, "}}")?;
                 let inner = &rest[2..end];
                 nodes.push(Node::Var(parse_path(inner)?));
                 self.pos += end + 2;
             } else {
                 // Starts with "{%" (the min() above guarantees one of them).
-                let end = rest.find("%}").ok_or(RenderError::UnclosedTag)?;
+                let end = close_after_opener(rest, "%}")?;
                 let inner = rest[2..end].trim().to_string();
                 let kw = inner.split_whitespace().next().unwrap_or("");
                 if terminators.contains(&kw) {
@@ -520,7 +522,7 @@ impl<'a> Parser<'a> {
     /// Consume the tag the parser is currently positioned at (through
     /// its `%}`).
     fn consume_tag(&mut self) -> EngineResult<()> {
-        let idx = self.rest().find("%}").ok_or(RenderError::UnclosedTag)?;
+        let idx = close_after_opener(self.rest(), "%}")?;
         self.pos += idx + 2;
         Ok(())
     }
@@ -845,6 +847,16 @@ impl<P: EmailProvider> TemplateSender<P> {
     }
 }
 
+/// Byte offset of `closer` in `rest`, searching only past the 2-byte
+/// opener (`{{` / `{%`) that `rest` starts with. A closer overlapping the
+/// opener (`{%}`) is not a closer: the tag is unclosed.
+fn close_after_opener(rest: &str, closer: &str) -> EngineResult<usize> {
+    rest.get(2..)
+        .and_then(|after| after.find(closer))
+        .map(|i| i + 2)
+        .ok_or(RenderError::UnclosedTag)
+}
+
 #[cfg(test)]
 mod engine_tests {
     use super::*;
@@ -866,6 +878,16 @@ mod engine_tests {
         let evil = json!({"v": "<script>alert(1)</script>"});
         let out = render("{{ v }}", &evil).unwrap();
         assert_eq!(out, "&lt;script&gt;alert(1)&lt;/script&gt;");
+    }
+
+    #[test]
+    fn closer_overlapping_opener_is_unclosed_not_a_panic() {
+        // `{%}` once sliced `rest[2..1]` and panicked the request task.
+        for src in ["{%}", "x {%}", "{%}%}", "{{}", "{% if user.name %}{%}"] {
+            assert!(render(src, &ctx()).is_err(), "{src:?} must fail closed");
+        }
+        assert_eq!(render("{%}", &ctx()), Err(RenderError::UnclosedTag));
+        assert_eq!(render("{{}", &ctx()), Err(RenderError::UnclosedTag));
     }
 
     #[test]
