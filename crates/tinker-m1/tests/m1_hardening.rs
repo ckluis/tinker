@@ -633,3 +633,88 @@ async fn composite_fk_rejects_cross_org_actor_reference() {
         "foreign key violation, got: {db_err:?}"
     );
 }
+
+/// Live challenges for (org, actor), read through FORCE-RLS with the
+/// tenant pinned for the transaction.
+async fn live_challenges(env: &common::Env, org: uuid::Uuid, actor: uuid::Uuid) -> i64 {
+    let mut tx = env.tenant.begin().await.unwrap();
+    sqlx::query(&format!("SET LOCAL app.organization_id = '{org}'"))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let n = sqlx::query_scalar(
+        "SELECT count(*) FROM auth_challenges WHERE actor_id = $1 \
+         AND consumed_at IS NULL AND expires_at > now()",
+    )
+    .bind(actor)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    n
+}
+
+/// Passkey start runs pre-authentication on caller-supplied ids. An
+/// unknown org or actor must look exactly like a real one (no 500-vs-200
+/// oracle) and write nothing; a real actor's live challenges are capped.
+#[tokio::test]
+async fn passkey_start_is_uniform_and_bounded() {
+    let env = setup().await;
+    let org = &env.org_a;
+
+    let stranger = uuid::Uuid::now_v7();
+    let (_, c1) = env
+        .sessions
+        .mint_passkey_challenge(org.org_id, stranger)
+        .await
+        .expect("unknown actor gets a decoy, not an error");
+    let (_, c2) = env
+        .sessions
+        .mint_passkey_challenge(uuid::Uuid::now_v7(), stranger)
+        .await
+        .expect("unknown org gets a decoy, not an FK error");
+    assert_eq!(c1.len(), c2.len(), "decoys have the real challenge shape");
+    assert_eq!(
+        live_challenges(&env, org.org_id, stranger).await,
+        0,
+        "decoys are not stored"
+    );
+
+    for _ in 0..12 {
+        env.sessions
+            .mint_passkey_challenge(org.org_id, org.actor_id)
+            .await
+            .unwrap();
+    }
+    assert_eq!(live_challenges(&env, org.org_id, org.actor_id).await, 5);
+
+    // The newest challenge still logs in.
+    let cookie = passkey_login(&env.router, org).await;
+    assert!(!cookie.is_empty());
+}
+
+/// Removing an actor from the organization ends their live session on the
+/// next request — sessions are not valid for the rest of their 12h life
+/// once the membership they were minted under is gone.
+#[tokio::test]
+async fn session_dies_with_membership() {
+    let env = setup().await;
+    let org = &env.org_a;
+    let cookie = passkey_login(&env.router, org).await;
+    let res = get_with_cookie(&env.router, "/apps/dashboard", &cookie).await;
+    assert_ne!(res.status(), StatusCode::SEE_OTHER, "live member is in");
+
+    sqlx::query("DELETE FROM memberships WHERE actor_id = $1 AND organization_id = $2")
+        .bind(org.actor_id)
+        .bind(org.org_id)
+        .execute(&env.system)
+        .await
+        .unwrap();
+
+    let res = get_with_cookie(&env.router, "/apps/dashboard", &cookie).await;
+    assert_eq!(
+        res.status(),
+        StatusCode::SEE_OTHER,
+        "ex-member is bounced to /login"
+    );
+}

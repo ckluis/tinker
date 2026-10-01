@@ -264,6 +264,23 @@ async fn find_session(
             hint: Some("re-run `initialize` with this key to open its own session"),
         });
     }
+    // Membership is re-read on every request: the role was resolved at
+    // `initialize`, and a demoted or removed actor must not keep it for
+    // as long as the session stays busy (the idle sweep never fires on
+    // an active session). Any change ends the session; the client
+    // re-initializes and gets the current role, or a teaching 403.
+    match FrontDoor::resolve_role(&state.core, session.door.tenant()).await {
+        Ok(role) if role == session.door.role() => {}
+        _ => {
+            state.sessions.write().await.remove(id);
+            return Err(HttpError {
+                status: StatusCode::UNAUTHORIZED,
+                error: "unauthorized",
+                message: "this key's membership changed since the session was opened".to_string(),
+                hint: Some("re-run `initialize` to open a session with the current role"),
+            });
+        }
+    }
     session.touch();
     Ok(session)
 }

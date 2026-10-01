@@ -128,6 +128,16 @@ impl FrontDoor {
     /// with a teaching error: the fix is operator-side
     /// (`tinker-cli mcp key issue --role <role>`), never a default the
     /// server invents.
+    /// The tenant this session is pinned to (org + actor from the key).
+    pub fn tenant(&self) -> &TenantContext {
+        &self.tenant
+    }
+
+    /// The membership role resolved at `initialize`.
+    pub fn role(&self) -> &str {
+        &self.role
+    }
+
     pub async fn resolve_role(core: &CoreDb, tenant: &TenantContext) -> Result<String> {
         let mut tx = core.tenant_tx(tenant).await?;
         let row: Option<(String,)> =

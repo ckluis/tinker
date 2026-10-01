@@ -975,3 +975,71 @@ async fn http_healthz_is_unauthenticated_and_minimal() {
         vec!["status", "version"]
     );
 }
+
+/// The role is re-read per request: changing or removing the key actor's
+/// membership ends the live session instead of letting the role frozen
+/// at `initialize` ride for as long as the client stays active.
+#[tokio::test]
+async fn http_session_ends_when_membership_changes() {
+    let env = setup().await;
+    let ctx = new_org(&env).await;
+    let (secret, cred) = issue_key(
+        &env,
+        ctx.organization_id.0,
+        "http-role-change",
+        "member",
+        &["mcp:tools", "mcp:resources"],
+    )
+    .await;
+    let server = spawn_server().await;
+    let (session, _) = initialize(&server, &secret).await;
+    let resp = post_rpc(&server, &secret, Some(&session), 2, "tools/list", json!({})).await;
+    ok_result(&resp);
+
+    sqlx::query(
+        "UPDATE memberships SET role = 'viewer' WHERE actor_id = $1 AND organization_id = $2",
+    )
+    .bind(cred.actor_id)
+    .bind(ctx.organization_id.0)
+    .execute(&env.core_owner)
+    .await
+    .unwrap();
+    let resp = post_rpc(&server, &secret, Some(&session), 3, "tools/list", json!({})).await;
+    assert_eq!(resp.status, StatusCode::UNAUTHORIZED, "{}", resp.body);
+    assert!(resp.body.contains("membership changed"), "{}", resp.body);
+    // The old session is gone for good, even if the role flips back.
+    let resp = post_rpc(&server, &secret, Some(&session), 4, "tools/list", json!({})).await;
+    assert_ne!(resp.status, StatusCode::OK);
+
+    // A fresh initialize picks up the current role.
+    let (session2, _) = initialize(&server, &secret).await;
+    ok_result(
+        &post_rpc(
+            &server,
+            &secret,
+            Some(&session2),
+            5,
+            "tools/list",
+            json!({}),
+        )
+        .await,
+    );
+
+    // Membership removed: the live session ends.
+    sqlx::query("DELETE FROM memberships WHERE actor_id = $1 AND organization_id = $2")
+        .bind(cred.actor_id)
+        .bind(ctx.organization_id.0)
+        .execute(&env.core_owner)
+        .await
+        .unwrap();
+    let resp = post_rpc(
+        &server,
+        &secret,
+        Some(&session2),
+        6,
+        "tools/list",
+        json!({}),
+    )
+    .await;
+    assert_eq!(resp.status, StatusCode::UNAUTHORIZED, "{}", resp.body);
+}

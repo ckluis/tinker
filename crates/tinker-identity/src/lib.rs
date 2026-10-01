@@ -221,6 +221,10 @@ impl tinker_auth::OidcBindingStore for PgOidcBindingStore {
     }
 }
 
+/// Live (unconsumed, unexpired) passkey challenges kept per actor. A
+/// login needs one; a handful covers parallel tabs and retries.
+const MAX_LIVE_CHALLENGES: i64 = 5;
+
 /// Issues and validates opaque server sessions.
 ///
 /// `tenant` (app role) serves everything inside a pinned tenant
@@ -316,11 +320,17 @@ impl SessionManager {
         let hash = Self::hash_token(&token);
         // Sessions span organizations; resolve on the owner handle and let
         // the row's own organization_id scope everything downstream.
+        // A session is only as live as the membership it was minted under:
+        // removing an actor from the organization ends their sessions on
+        // the next request, not at the 12h expiry.
         let row = sqlx::query!(
-            r#"SELECT id, organization_id, workspace_id, actor_id, method,
-                      assurance, expires_at,
-                      (revoked_at IS NOT NULL OR expires_at <= now()) AS "dead!"
-               FROM sessions WHERE token_hash = $1"#,
+            r#"SELECT s.id, s.organization_id, s.workspace_id, s.actor_id, s.method,
+                      s.assurance, s.expires_at,
+                      (s.revoked_at IS NOT NULL OR s.expires_at <= now()
+                       OR NOT EXISTS (SELECT 1 FROM memberships m
+                                      WHERE m.actor_id = s.actor_id
+                                        AND m.organization_id = s.organization_id)) AS "dead!"
+               FROM sessions s WHERE s.token_hash = $1"#,
             hash
         )
         .fetch_optional(&self.system)
@@ -383,6 +393,43 @@ impl SessionManager {
     ) -> Result<(Uuid, String)> {
         let bytes = tinker_auth::fresh_challenge_bytes();
         let mut tx = tenant_tx(&self.tenant, organization_id, actor_id, "passkey.mint").await?;
+        // This runs pre-authentication on caller-supplied ids. Only an
+        // actor holding a live passkey gets a stored challenge; any other
+        // (org, actor) pair — nonexistent, or without a passkey — gets a
+        // decoy of the same shape and nothing is written. Before this, an
+        // unknown pair failed the FK (500 vs 200: a membership oracle)
+        // and a known one could be made to insert rows without bound.
+        let enrolled = sqlx::query_scalar!(
+            r#"SELECT EXISTS (SELECT 1 FROM auth_credentials
+                WHERE organization_id = $1 AND actor_id = $2
+                  AND method = 'passkey' AND revoked_at IS NULL) AS "e!""#,
+            organization_id,
+            actor_id,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        if !enrolled {
+            tx.commit().await.map_err(TinkerError::Db)?;
+            return Ok((Uuid::new_v4(), tinker_auth::passkey::b64url(&bytes)));
+        }
+        // Bound live challenges per actor: drop dead rows, then keep only
+        // the newest MAX_LIVE_CHALLENGES - 1 so the insert lands at the cap.
+        sqlx::query!(
+            r#"DELETE FROM auth_challenges
+               WHERE organization_id = $1 AND actor_id = $2
+                 AND (consumed_at IS NOT NULL OR expires_at <= now()
+                      OR id IN (SELECT id FROM auth_challenges
+                                WHERE organization_id = $1 AND actor_id = $2
+                                  AND consumed_at IS NULL AND expires_at > now()
+                                ORDER BY created_at DESC OFFSET $3))"#,
+            organization_id,
+            actor_id,
+            MAX_LIVE_CHALLENGES - 1,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
         let row = sqlx::query!(
             r#"INSERT INTO auth_challenges
                (organization_id, actor_id, challenge, expires_at)
