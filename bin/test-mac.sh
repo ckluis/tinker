@@ -30,10 +30,16 @@ if ! redis-cli -p "$REDIS_PORT" ping >/dev/null 2>&1; then
 fi
 export TINKER_TEST_REDIS_URL="redis://127.0.0.1:$REDIS_PORT/"
 
+# Browser test: Playwright's chrome-headless-shell. The full Chrome for
+# Testing app never commits a navigation in headless mode on this macOS
+# (location stays about:blank, screenshots hang); the headless shell
+# renders normally.
 if [ -z "${TINKER_TEST_CHROME:-}" ]; then
-  CFT=$(ls -d "$HOME"/Library/Caches/ms-playwright/chromium-*/chrome-mac-arm64/"Google Chrome for Testing.app"/Contents/MacOS/"Google Chrome for Testing" 2>/dev/null | tail -1)
-  [ -n "$CFT" ] && export TINKER_TEST_CHROME="$CFT"
+  HS=$(ls -d "$HOME"/Library/Caches/ms-playwright/chromium_headless_shell-*/chrome-headless-shell-mac-arm64/chrome-headless-shell 2>/dev/null | tail -1)
+  [ -n "$HS" ] && export TINKER_TEST_CHROME="$HS"
 fi
+
+export TINKER_TEST_PROOF_DIR="${TINKER_TEST_PROOF_DIR:-$HERE/target/browser-proofs}"
 
 mkdir -p _eval/runs
 LOG="_eval/runs/$(date +%Y%m%dT%H%M%S).log"

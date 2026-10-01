@@ -53,3 +53,19 @@ Branch `pii-sensitive-fields` (off `round-1-pg18-hardening`). Design + decisions
 **Disk:** a full workspace test build reached 22 GB in `target/` and filled the disk. `bin/test-mac.sh` now builds with `CARGO_INCREMENTAL=0` and line-table debug info (about 4 GB).
 
 **Not in this round:** ingest/comms writers into sensitive columns (they fail closed on the UUID type, so the CRM pack's email/phone are deliberately NOT marked sensitive until ingest seals); toggling `sensitive` on a populated field; an MCP-exposed erasure tool.
+
+# Round 3: remaining items, 2026-10-01
+
+Branch `round-3-remaining` (off `pii-sensitive-fields`). **Full suite: 651 passed / 0 failed / 1 ignored** (the ignored test is the timing bench), including the browser test on macOS. fmt and clippy `-D warnings` are clean.
+
+| Item | Fix | Test |
+|---|---|---|
+| Self-approval of generic approvals | Migration 0047 adds `approval_requests.requested_by`; `ApprovalEngine::decide` refuses the requester, whether approving or denying | `m7_approval_expiry::requester_cannot_decide_their_own_request`; four suites that self-approved now use a second actor |
+| Ingest into sensitive fields | `IngestPipeline::with_pii` seals at promotion, matches identity and runs survivorship on the blind index, stores provenance as a digest, and scrubs landing to a `{"$tinker_sealed": digest}` marker | `m6_ingest::ingest_seals_sensitive_fields_and_scrubs_landing` (proven: fails with the scrub removed) |
+| Turning on `sensitive` for a populated field | `PiiSealer::make_field_sensitive` (rows, drafts, versions, audit; new column; plaintext column dropped) plus `IngestPipeline::retrofit_sensitive` (provenance, landing); `tinker-cli field make-sensitive` | `pii_sensitive::populated_field_can_be_made_sensitive`, `m6_ingest::ingested_plaintext_field_retrofits_to_sensitive` |
+| MCP erasure | `erase` tool: owner/admin, explicit `mcp:tool:erase`, purpose audited as `pii.erase`; shares `pii_gate` with `reveal` | `pii_sensitive::erase_tool_destroys_sensitive_values_under_the_same_gate` |
+| OIDC accepted a bare `id_token` | Authorization-code flow with PKCE S256, a single-use 5-minute `state`, and a `nonce` the adapter requires (migration 0048); bare-token endpoint removed | `m1_hardening::oidc_token_abuse_fails_closed` (proven: the foreign-nonce case fails without the check), `oidc_callback_is_single_use_and_bare_tokens_are_refused`, fake IdP enforcing PKCE |
+| "Passkeys" were raw Ed25519 labelled MFA | `tinker-auth::webauthn` verifies client data type, challenge and origin, rpIdHash, UP, the counter, and the signature (ES256 + EdDSA COSE). MFA only when UV is set. Registration endpoints added; COSE storage in migration 0049 (legacy rows still verify); the login page runs the real browser ceremonies | `webauthn` unit tests (every binding), `m1_hardening::webauthn_register_then_login_binds_origin_and_assurance` (phishing origin, counter replay, UV assurance) |
+| Browser test on macOS | Root cause: the full Chrome for Testing app never commits a navigation in headless mode on this macOS. Uses Playwright's `chrome-headless-shell` and starts at the server URL with LNA checks off. Proof directory is configurable (`target/browser-proofs`) | `browser_verifies_schema_builder` passes |
+
+**Product decision still open:** whether the CRM pack's `email`/`phone` should be sensitive by default. Doing so seals them for every tenant (platform fields are shared) and turns off the agents' plaintext per-role transforms (mask, tokenize, bucket) on those fields. The tooling to flip them now exists: `tinker-cli field make-sensitive`.

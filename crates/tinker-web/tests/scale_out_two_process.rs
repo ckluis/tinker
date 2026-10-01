@@ -21,7 +21,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use tinker_identity::{Authorizer, SessionManager};
 use uuid::Uuid;
 
@@ -266,7 +266,16 @@ async fn passkey_login(base: &str, org: &OrgFixture) -> String {
     let challenge = URL_SAFE_NO_PAD
         .decode(start["challenge"].as_str().unwrap())
         .unwrap();
-    let sig = org.signing_key.sign(&challenge);
+    // A real WebAuthn assertion for the servers' relying party
+    // (TINKER_HOST=tinker.test → RP ID tinker.test, origin https://tinker.test).
+    let rp = tinker_auth::webauthn::RelyingParty::from_env("tinker.test");
+    let (cd, ad, sig) = tinker_auth::webauthn::soft_authenticator::ed25519_assertion(
+        &org.signing_key,
+        &rp,
+        &challenge,
+        0,
+        true,
+    );
     let res = c
         .post(format!("{base}/login/passkey/finish"))
         .json(&serde_json::json!({
@@ -274,7 +283,9 @@ async fn passkey_login(base: &str, org: &OrgFixture) -> String {
             "workspace_id": org.workspace_id.to_string(),
             "credential_id": org.credential_id,
             "challenge_id": start["challenge_id"].as_str().unwrap(),
-            "signature": URL_SAFE_NO_PAD.encode(sig.to_bytes()),
+            "client_data_json": cd,
+            "authenticator_data": ad,
+            "signature": sig,
         }))
         .send()
         .await

@@ -43,11 +43,18 @@ fn env(key: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| panic!("{key} must be set"))
 }
 
+/// Screenshots + driver logs. `TINKER_TEST_PROOF_DIR` overrides the
+/// cell's default of ~/workspace/tinker-item34-proofs.
 fn proof_dir() -> std::path::PathBuf {
-    let home = std::env::var("HOME").expect("HOME must be set");
-    let dir = std::path::PathBuf::from(home)
-        .join("workspace")
-        .join("tinker-item34-proofs");
+    let dir = match std::env::var("TINKER_TEST_PROOF_DIR") {
+        Ok(d) if !d.is_empty() => std::path::PathBuf::from(d),
+        _ => {
+            let home = std::env::var("HOME").expect("HOME must be set");
+            std::path::PathBuf::from(home)
+                .join("workspace")
+                .join("tinker-item34-proofs")
+        }
+    };
     std::fs::create_dir_all(&dir).expect("create proof dir");
     dir
 }
@@ -307,6 +314,16 @@ async fn browser_verifies_schema_builder() {
     .expect("write bootstrap page");
     let chrome_profile = proofs.join("chrome-profile");
     let _ = std::fs::remove_dir_all(&chrome_profile);
+    // An overridden Chrome (TINKER_TEST_CHROME, e.g. Chrome for Testing on
+    // macOS) starts directly at the server — a command-line URL is a
+    // browser-initiated navigation — with Local Network Access checks off.
+    // There the file:// bootstrap's script hop hangs the renderer on an
+    // LNA permission prompt that headless mode can never answer.
+    let start_url = if std::env::var("TINKER_TEST_CHROME").is_ok() {
+        bootstrap_target.clone()
+    } else {
+        format!("file://{}", bootstrap.display())
+    };
     let mut chrome = ChromeGuard {
         child: Command::new(chrome())
             .args([
@@ -315,10 +332,11 @@ async fn browser_verifies_schema_builder() {
                 "--disable-gpu",
                 "--disable-dev-shm-usage",
                 "--allow-file-access-from-files",
+                "--disable-features=LocalNetworkAccessChecks",
                 &format!("--remote-debugging-port={CDP_PORT}"),
                 &format!("--user-data-dir={}", chrome_profile.display()),
                 "--window-size=1440,900",
-                &format!("file://{}", bootstrap.display()),
+                &start_url,
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
