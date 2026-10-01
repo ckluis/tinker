@@ -363,6 +363,32 @@ impl LifecycleEngine {
         Ok(())
     }
 
+    /// Retire every live (`pending`/`approved`) approval bound to this
+    /// draft. Approvals bind to (action, draft_id), not to content, so an
+    /// approval decided on one version of a draft must not survive into
+    /// the next: without this, a `publish` approved for v1, followed by
+    /// reject → edit → resubmit, could publish v2 unreviewed. Called
+    /// wherever the content a reviewer saw stops being the content that
+    /// would ship (content edit, rejection). Retired rows read `expired`:
+    /// the window in which that decision was valid has closed.
+    async fn supersede_draft_approvals(
+        tx: &mut Transaction<'_, Postgres>,
+        ctx: &TenantContext,
+        draft_id: Uuid,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE approval_requests SET status = 'expired' \
+             WHERE organization_id = $1 AND status IN ('pending', 'approved') \
+               AND payload->>'draft_id' = $2",
+        )
+        .bind(ctx.organization_id.0)
+        .bind(draft_id.to_string())
+        .execute(&mut **tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        Ok(())
+    }
+
     /// Read the current published content of a data row as
     /// api_name → JSON. Used to pre-fill an edit draft.
     async fn read_published_content(
@@ -652,6 +678,7 @@ impl LifecycleEngine {
         .map_err(TinkerError::Db)?;
         let draft =
             to_draft(row.ok_or_else(|| TinkerError::Internal("draft update lost".into()))?)?;
+        Self::supersede_draft_approvals(&mut tx, ctx, draft_id).await?;
         Self::audit_transition(
             &mut tx,
             ctx,
@@ -1013,6 +1040,7 @@ impl LifecycleEngine {
         .map_err(TinkerError::Db)?;
         let draft =
             to_draft(row.ok_or_else(|| TinkerError::Internal("draft reject lost".into()))?)?;
+        Self::supersede_draft_approvals(&mut tx, ctx, draft_id).await?;
         Self::audit_transition(
             &mut tx,
             ctx,

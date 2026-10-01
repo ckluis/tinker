@@ -780,6 +780,170 @@ async fn reject_revise_resubmit_flow() {
     assert_eq!(versions[0].content["title"], serde_json::json!("Polished"));
 }
 
+/// `approval_requests` is FORCE-RLS: read it through the tenant tx.
+async fn approval_status(env: &common::Env, ctx: &TenantContext, id: Uuid) -> String {
+    let mut tx = env.core.tenant_tx(ctx).await.unwrap();
+    let status = sqlx::query_scalar("SELECT status FROM approval_requests WHERE id=$1")
+        .bind(id)
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    status
+}
+
+/// An approval binds to (action, draft_id), not to content. A `publish`
+/// approval decided while v1 was in review must not ship v2 after
+/// reject → revise → edit → resubmit: rejection (and any content edit)
+/// retires every live approval bound to the draft.
+#[tokio::test]
+async fn stale_publish_approval_does_not_survive_reject_and_edit() {
+    let env = common::setup().await;
+    let w = setup_world(&env).await;
+    let (_ont, lc, ap, _rt) = engines(&env);
+
+    let draft = lc
+        .create_draft(
+            &w.ctx_author,
+            w.article,
+            None,
+            &values(&[("title", "Reviewed")]),
+        )
+        .await
+        .unwrap();
+    let sub = draft_approval(
+        &ap,
+        &w,
+        &w.ctx_reviewer,
+        draft.draft_id,
+        "submit_for_review",
+        Some(true),
+    )
+    .await;
+    lc.submit_for_review(&w.ctx_author, draft.draft_id, sub)
+        .await
+        .unwrap();
+    // Reviewer approves publishing v1 ... then rejects for another reason.
+    let stale = draft_approval(
+        &ap,
+        &w,
+        &w.ctx_reviewer,
+        draft.draft_id,
+        "publish",
+        Some(true),
+    )
+    .await;
+    lc.reject(&w.ctx_reviewer, draft.draft_id, "one more fix")
+        .await
+        .unwrap();
+
+    // Author revises to content the reviewer never saw, and resubmits.
+    lc.revise(&w.ctx_author, draft.draft_id).await.unwrap();
+    lc.update_draft(
+        &w.ctx_author,
+        draft.draft_id,
+        &values(&[("title", "Unreviewed")]),
+    )
+    .await
+    .unwrap();
+    let sub2 = draft_approval(
+        &ap,
+        &w,
+        &w.ctx_reviewer,
+        draft.draft_id,
+        "submit_for_review",
+        Some(true),
+    )
+    .await;
+    lc.submit_for_review(&w.ctx_author, draft.draft_id, sub2)
+        .await
+        .unwrap();
+
+    let err = lc
+        .publish(&w.ctx_author, draft.draft_id, stale)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, TinkerError::Forbidden(_)),
+        "stale approval must not publish, got {err:?}"
+    );
+    assert_eq!(approval_status(&env, &w.ctx_author, stale).await, "expired");
+
+    // A fresh decision on the current content still publishes.
+    let fresh = draft_approval(
+        &ap,
+        &w,
+        &w.ctx_reviewer,
+        draft.draft_id,
+        "publish",
+        Some(true),
+    )
+    .await;
+    let out = lc
+        .publish(&w.ctx_author, draft.draft_id, fresh)
+        .await
+        .unwrap();
+    let versions = lc
+        .list_versions(&w.ctx_viewer, w.article, out.record_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        versions[0].content["title"],
+        serde_json::json!("Unreviewed")
+    );
+}
+
+/// A draft edit also retires approvals requested against the old content.
+#[tokio::test]
+async fn draft_edit_retires_pending_and_approved_approvals() {
+    let env = common::setup().await;
+    let w = setup_world(&env).await;
+    let (_ont, lc, ap, _rt) = engines(&env);
+
+    let draft = lc
+        .create_draft(
+            &w.ctx_author,
+            w.article,
+            None,
+            &values(&[("title", "First")]),
+        )
+        .await
+        .unwrap();
+    let approved = draft_approval(
+        &ap,
+        &w,
+        &w.ctx_reviewer,
+        draft.draft_id,
+        "submit_for_review",
+        Some(true),
+    )
+    .await;
+    let pending = draft_approval(
+        &ap,
+        &w,
+        &w.ctx_reviewer,
+        draft.draft_id,
+        "submit_for_review",
+        None,
+    )
+    .await;
+    lc.update_draft(
+        &w.ctx_author,
+        draft.draft_id,
+        &values(&[("title", "Second")]),
+    )
+    .await
+    .unwrap();
+    for id in [approved, pending] {
+        assert_eq!(approval_status(&env, &w.ctx_author, id).await, "expired");
+    }
+    let err = lc
+        .submit_for_review(&w.ctx_author, draft.draft_id, approved)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TinkerError::Forbidden(_)), "got {err:?}");
+}
+
 // ---------------------------------------------------------------------------
 // Versions and archive
 // ---------------------------------------------------------------------------
