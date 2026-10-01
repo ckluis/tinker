@@ -197,13 +197,40 @@ async fn tool(door: &FrontDoor, name: &str, args: Value) -> Result<Value, Value>
     }
 }
 
-async fn reveal(door: &FrontDoor, slug: &str, id: &str, field: &str) -> Result<Value, Value> {
+/// The full second-person reveal: the caller files a pii.reveal request,
+/// a different admin approves it, the caller reveals with its id.
+async fn reveal(
+    env: &Env,
+    org: Uuid,
+    door: &FrontDoor,
+    slug: &str,
+    id: &str,
+    field: &str,
+) -> Result<Value, Value> {
+    let req = tool(
+        door,
+        "request_reveal",
+        json!({"object": slug, "record_id": id, "field": field, "purpose": "support ticket 42"}),
+    )
+    .await?;
+    let approver = issue_key(env, org, "admin", &["mcp:tools", "mcp:tool:approvals"]).await;
+    tool(
+        &door_for(env, &approver).await,
+        "approvals",
+        json!({"action": "approve", "id": req["approval_request_id"]}),
+    )
+    .await?;
     tool(
         door,
         "reveal",
-        json!({"object": slug, "record_id": id, "field": field, "purpose": "support ticket 42"}),
+        json!({"object": slug, "record_id": id, "field": field,
+               "approval_request_id": req["approval_request_id"]}),
     )
     .await
+}
+
+async fn door_for(env: &Env, cred: &VerifiedCredential) -> FrontDoor {
+    door(env, cred, true).await
 }
 
 #[tokio::test]
@@ -215,7 +242,7 @@ async fn sensitive_values_are_sealed_masked_findable_and_revealable() {
         &env,
         ctx.organization_id.0,
         "admin",
-        &["mcp:tools", "mcp:tool:reveal"],
+        &["mcp:tools", "mcp:tool:reveal", "mcp:tool:request_reveal"],
     )
     .await;
     let d = door(&env, &admin, true).await;
@@ -334,7 +361,9 @@ async fn sensitive_values_are_sealed_masked_findable_and_revealable() {
     assert!(err.to_string().contains("sensitive"), "{err}");
 
     // Reveal returns the original plaintext and audits the purpose only.
-    let v = reveal(&d, &slug, &id, "email").await.unwrap();
+    let v = reveal(&env, ctx.organization_id.0, &d, &slug, &id, "email")
+        .await
+        .unwrap();
     assert_eq!(v["value"], "Maya.Chen@Example.com");
     let mut tx = env.core.tenant_tx(&ctx).await.unwrap();
     let meta: Vec<String> = sqlx::query_scalar(
@@ -361,7 +390,9 @@ async fn sensitive_values_are_sealed_masked_findable_and_revealable() {
     .await
     .unwrap();
     assert_eq!(
-        reveal(&d, &slug, &id, "email").await.unwrap()["value"],
+        reveal(&env, ctx.organization_id.0, &d, &slug, &id, "email")
+            .await
+            .unwrap()["value"],
         "maya@new.example"
     );
     let old = tool(&d, "query", find("maya.chen@example.com"))
@@ -373,7 +404,9 @@ async fn sensitive_values_are_sealed_masked_findable_and_revealable() {
     );
 
     // Non-sensitive fields are not revealable (they are plain reads).
-    let err = reveal(&d, &slug, &id, "name").await.unwrap_err();
+    let err = reveal(&env, ctx.organization_id.0, &d, &slug, &id, "name")
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("not sensitive"), "{err}");
 
     // Erasure destroys every value the record ever sealed — including the
@@ -418,7 +451,7 @@ async fn reveal_is_gated_by_role_scope_and_tenant() {
         &env,
         ctx.organization_id.0,
         "admin",
-        &["mcp:tools", "mcp:tool:reveal"],
+        &["mcp:tools", "mcp:tool:reveal", "mcp:tool:request_reveal"],
     )
     .await;
     let d = door(&env, &admin, true).await;
@@ -435,9 +468,16 @@ async fn reveal_is_gated_by_role_scope_and_tenant() {
 
     // Blanket mcp:tools does not cover reveal: protocol-level scope denial.
     let no_scope = issue_key(&env, ctx.organization_id.0, "admin", &["mcp:tools"]).await;
-    let err = reveal(&door(&env, &no_scope, true).await, &slug, &id, "email")
-        .await
-        .unwrap_err();
+    let err = reveal(
+        &env,
+        ctx.organization_id.0,
+        &door(&env, &no_scope, true).await,
+        &slug,
+        &id,
+        "email",
+    )
+    .await
+    .unwrap_err();
     assert_eq!(err["code"], -32001, "{err}");
 
     // Scope without the role: forbidden.
@@ -445,12 +485,19 @@ async fn reveal_is_gated_by_role_scope_and_tenant() {
         &env,
         ctx.organization_id.0,
         "member",
-        &["mcp:tools", "mcp:tool:reveal"],
+        &["mcp:tools", "mcp:tool:reveal", "mcp:tool:request_reveal"],
     )
     .await;
-    let err = reveal(&door(&env, &member, true).await, &slug, &id, "email")
-        .await
-        .unwrap_err();
+    let err = reveal(
+        &env,
+        ctx.organization_id.0,
+        &door(&env, &member, true).await,
+        &slug,
+        &id,
+        "email",
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("owner or admin"), "{err}");
 
     // Another org's admin: the record does not exist for them.
@@ -460,17 +507,19 @@ async fn reveal_is_gated_by_role_scope_and_tenant() {
         &env,
         ctx_b.organization_id.0,
         "admin",
-        &["mcp:tools", "mcp:tool:reveal"],
+        &["mcp:tools", "mcp:tool:reveal", "mcp:tool:request_reveal"],
     )
     .await;
     let d_b = door(&env, &admin_b, true).await;
-    let err = reveal(&d_b, &slug_b, &id, "email").await.unwrap_err();
+    let err = reveal(&env, ctx_b.organization_id.0, &d_b, &slug_b, &id, "email")
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("not_found"), "{err}");
 
     // A purpose is mandatory.
     let err = tool(
         &d,
-        "reveal",
+        "request_reveal",
         json!({"object": slug, "record_id": id, "field": "email", "purpose": ""}),
     )
     .await
@@ -487,7 +536,7 @@ async fn sealed_forms_cannot_be_smuggled_and_no_vault_fails_closed() {
         &env,
         ctx.organization_id.0,
         "admin",
-        &["mcp:tools", "mcp:tool:reveal"],
+        &["mcp:tools", "mcp:tool:reveal", "mcp:tool:request_reveal"],
     )
     .await;
     let d = door(&env, &admin, true).await;
@@ -622,7 +671,7 @@ async fn populated_field_can_be_made_sensitive() {
         &env,
         ctx.organization_id.0,
         "admin",
-        &["mcp:tools", "mcp:tool:reveal"],
+        &["mcp:tools", "mcp:tool:reveal", "mcp:tool:request_reveal"],
     )
     .await;
     let before = door(&env, &admin, true).await;
@@ -689,11 +738,29 @@ async fn populated_field_can_be_made_sensitive() {
     .unwrap();
     assert_eq!(rec["record"]["national_id"], MASK);
     assert_eq!(
-        reveal(&after, &slug, &ids[0], "national_id").await.unwrap()["value"],
+        reveal(
+            &env,
+            ctx.organization_id.0,
+            &after,
+            &slug,
+            &ids[0],
+            "national_id"
+        )
+        .await
+        .unwrap()["value"],
         "NI-ANN-0099"
     );
     assert_eq!(
-        reveal(&after, &slug, &ids[1], "national_id").await.unwrap()["value"],
+        reveal(
+            &env,
+            ctx.organization_id.0,
+            &after,
+            &slug,
+            &ids[1],
+            "national_id"
+        )
+        .await
+        .unwrap()["value"],
         "NI-BOB-0002"
     );
     let hit = tool(
@@ -731,7 +798,12 @@ async fn erase_tool_destroys_sensitive_values_under_the_same_gate() {
         &env,
         ctx.organization_id.0,
         "admin",
-        &["mcp:tools", "mcp:tool:reveal", "mcp:tool:erase"],
+        &[
+            "mcp:tools",
+            "mcp:tool:reveal",
+            "mcp:tool:request_reveal",
+            "mcp:tool:erase",
+        ],
     )
     .await;
     let d = door(&env, &admin, true).await;
@@ -783,7 +855,9 @@ async fn erase_tool_destroys_sensitive_values_under_the_same_gate() {
     assert_eq!(rec["record"]["phone"], Value::Null);
     assert_eq!(rec["record"]["name"], "Eve");
     assert_eq!(
-        reveal(&d, &slug, &id, "email").await.unwrap()["value"],
+        reveal(&env, ctx.organization_id.0, &d, &slug, &id, "email")
+            .await
+            .unwrap()["value"],
         Value::Null
     );
     let mut tx = env.core.tenant_tx(&ctx).await.unwrap();
@@ -925,4 +999,97 @@ async fn automation_tool_saves_keys_and_reports_runs() {
         .await
         .unwrap();
     assert_eq!(got["record"]["name"], "VIP");
+}
+
+async fn reveal_with(
+    d: &FrontDoor,
+    slug: &str,
+    id: &str,
+    approval: Value,
+    field: &str,
+) -> Result<Value, Value> {
+    tool(
+        d,
+        "reveal",
+        json!({"object": slug, "record_id": id, "field": field, "approval_request_id": approval}),
+    )
+    .await
+}
+
+/// Samen parity: plaintext needs a second person. No approval, a
+/// self-approval, a reused approval, or one for another field never
+/// reveals; an approved request reveals exactly once.
+#[tokio::test]
+async fn reveal_needs_a_fresh_second_person_approval_for_that_field() {
+    let env = setup().await;
+    let ctx = new_org(&env).await;
+    let org = ctx.organization_id.0;
+    let (_, slug) = contact_object(&env, &ctx).await;
+    let scopes = [
+        "mcp:tools",
+        "mcp:tool:reveal",
+        "mcp:tool:request_reveal",
+        "mcp:tool:approvals",
+    ];
+    let alice = issue_key(&env, org, "admin", &scopes).await;
+    let bob = issue_key(&env, org, "admin", &scopes).await;
+    let (a, b) = (door(&env, &alice, true).await, door(&env, &bob, true).await);
+    let id = tool(
+        &a,
+        "create_record",
+        json!({"object": slug, "values": {"email": "z@q.example", "phone": "+1555"}}),
+    )
+    .await
+    .unwrap()["record_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // No approval at all: a made-up id is refused.
+    let err = reveal_with(&a, &slug, &id, json!(Uuid::now_v7()), "email")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("approved pii.reveal"), "{err}");
+
+    let req = tool(
+        &a,
+        "request_reveal",
+        json!({"object": slug, "record_id": id, "field": "email", "purpose": "DSR check"}),
+    )
+    .await
+    .unwrap();
+    let rid = req["approval_request_id"].clone();
+    // Pending (not yet approved) is refused; self-approval is refused.
+    assert!(reveal_with(&a, &slug, &id, rid.clone(), "email")
+        .await
+        .is_err());
+    let err = tool(&a, "approvals", json!({"action": "approve", "id": rid}))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("requester"), "{err}");
+    // Bob approves. Bob cannot use Alice's approval; Alice cannot use it
+    // for another field; Alice reveals the email exactly once.
+    tool(&b, "approvals", json!({"action": "approve", "id": rid}))
+        .await
+        .unwrap();
+    assert!(
+        reveal_with(&b, &slug, &id, rid.clone(), "email")
+            .await
+            .is_err(),
+        "not the requester"
+    );
+    assert!(
+        reveal_with(&a, &slug, &id, rid.clone(), "phone")
+            .await
+            .is_err(),
+        "other field"
+    );
+    let v = reveal_with(&a, &slug, &id, rid.clone(), "email")
+        .await
+        .unwrap();
+    assert_eq!(v["value"], "z@q.example");
+    let err = reveal_with(&a, &slug, &id, rid, "email").await.unwrap_err();
+    assert!(
+        err.to_string().contains("approved pii.reveal") || err.to_string().contains("already used"),
+        "{err}"
+    );
 }

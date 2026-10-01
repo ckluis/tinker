@@ -392,6 +392,8 @@ impl FrontDoor {
             "reveal" => self.tool_reveal(&args).await,
             "erase" => self.tool_erase(&args).await,
             "automation" => self.tool_automation(&args).await,
+            "request_reveal" => self.tool_request_reveal(&args).await,
+            "approvals" => self.tool_approvals(&args).await,
             _ => {
                 return rpc_error_value(
                     ERR_INVALID_PARAMS,
@@ -790,33 +792,58 @@ impl FrontDoor {
     /// record through the role's row policy — before the vault is
     /// touched, and the vault projector audits the disclosure.
     async fn tool_reveal(&self, args: &Value) -> Result<Value> {
-        check_unknown_keys(args, &["object", "record_id", "field", "purpose"], "reveal")?;
+        check_unknown_keys(
+            args,
+            &["object", "record_id", "field", "approval_request_id"],
+            "reveal",
+        )?;
         let slug = require_str(args, "object")?;
         let field = require_str(args, "field")?;
-        let purpose = require_str(args, "purpose")?;
         let record_id: Uuid = require_str(args, "record_id")?
             .parse()
             .map_err(|_| TinkerError::Validation("reveal: \"record_id\" must be a uuid".into()))?;
-        let purpose = purpose.trim();
-        if purpose.len() < 3 || purpose.len() > 500 {
-            return Err(TinkerError::Validation(
-                "reveal: \"purpose\" must be 3-500 chars; it is recorded in the audit trail".into(),
-            ));
-        }
+        let approval_id: Uuid =
+            require_str(args, "approval_request_id")?
+                .parse()
+                .map_err(|_| {
+                    TinkerError::Validation("reveal: \"approval_request_id\" must be a uuid".into())
+                })?;
         let (sealer, object_id, inputs) = self.pii_gate("reveal", &slug, record_id).await?;
-        // Hidden and unknown fields look the same: not_found.
-        let f = inputs
-            .desc
-            .fields
-            .iter()
-            .find(|f| f.api_name == field && inputs.projection.allows(object_id, &field))
-            .ok_or_else(|| TinkerError::NotFound(format!("field {field}")))?;
-        if !f.sensitive {
-            return Err(TinkerError::Validation(format!(
-                "reveal: field '{field}' is not sensitive; read it with get_record"
-            )));
-        }
+        let f = Self::sensitive_field(&inputs, object_id, &field)?;
         let mut tx = self.state.core.tenant_tx(&self.tenant).await?;
+        // Second person (samen parity): an approved, unexpired pii.reveal
+        // for exactly this (object, record, field), requested by this
+        // caller and — by the approval engine's four-eyes rule — decided
+        // by someone else. Consumed atomically: one approval, one reveal.
+        let row: Option<(String, Value, Option<Uuid>)> = sqlx::query_as(
+            "SELECT action_name, payload, requested_by FROM approval_requests \
+             WHERE organization_id = $1 AND id = $2 FOR UPDATE",
+        )
+        .bind(self.tenant.organization_id.0)
+        .bind(approval_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        let purpose = match row {
+            Some((action, payload, requested_by))
+                if action == REVEAL_ACTION
+                    && payload["object_id"] == object_id.to_string()
+                    && payload["record_id"] == record_id.to_string()
+                    && payload["field"] == field.as_str()
+                    && requested_by == Some(self.tenant.actor_id) =>
+            {
+                payload["purpose"].as_str().unwrap_or("reveal").to_string()
+            }
+            _ => {
+                return Err(TinkerError::Forbidden(
+                    "reveal needs an approved pii.reveal request for this field, filed by you \
+                     (request_reveal) and approved by someone else (approvals)"
+                        .into(),
+                ))
+            }
+        };
+        tinker_ontology::mutate::consume_approval(&mut tx, &self.tenant, true, Some(approval_id))
+            .await?;
         let ref_id: Option<Uuid> = sqlx::query_scalar(&format!(
             "SELECT \"{}\" FROM data.{} WHERE organization_id = $1 AND id = $2",
             f.physical_column, inputs.desc.api_slug
@@ -831,7 +858,7 @@ impl FrontDoor {
         let value = match ref_id {
             Some(r) => Value::String(
                 sealer
-                    .reveal(&self.state.core, &self.tenant, r, purpose)
+                    .reveal(&self.state.core, &self.tenant, r, &purpose)
                     .await?,
             ),
             None => Value::Null,
@@ -842,6 +869,131 @@ impl FrontDoor {
             "field": field,
             "value": value,
         }))
+    }
+
+    /// A sensitive field the caller's role can see; hidden and unknown
+    /// fields look the same (not_found).
+    fn sensitive_field<'a>(
+        inputs: &'a tinker_live::QueryInputs,
+        object_id: Uuid,
+        field: &str,
+    ) -> Result<&'a tinker_ontology::FieldDescription> {
+        let f = inputs
+            .desc
+            .fields
+            .iter()
+            .find(|f| f.api_name == field && inputs.projection.allows(object_id, field))
+            .ok_or_else(|| TinkerError::NotFound(format!("field {field}")))?;
+        if !f.sensitive {
+            return Err(TinkerError::Validation(format!(
+                "field '{field}' is not sensitive; read it with get_record"
+            )));
+        }
+        Ok(f)
+    }
+
+    /// `request_reveal`: file a pii.reveal approval for one field of one
+    /// record, with its purpose. Same gate as `reveal`; a second person
+    /// decides it through `approvals`.
+    async fn tool_request_reveal(&self, args: &Value) -> Result<Value> {
+        check_unknown_keys(
+            args,
+            &["object", "record_id", "field", "purpose"],
+            "request_reveal",
+        )?;
+        let slug = require_str(args, "object")?;
+        let field = require_str(args, "field")?;
+        let purpose = require_str(args, "purpose")?;
+        let purpose = purpose.trim();
+        if purpose.len() < 3 || purpose.len() > 500 {
+            return Err(TinkerError::Validation(
+                "request_reveal: \"purpose\" must be 3-500 chars; it is recorded in the audit trail"
+                    .into(),
+            ));
+        }
+        let record_id: Uuid = require_str(args, "record_id")?.parse().map_err(|_| {
+            TinkerError::Validation("request_reveal: \"record_id\" must be a uuid".into())
+        })?;
+        let (_, object_id, inputs) = self.pii_gate("reveal", &slug, record_id).await?;
+        Self::sensitive_field(&inputs, object_id, &field)?;
+        let req =
+            tinker_agents::ApprovalEngine::new(self.state.core.clone(), self.state.owner.clone())
+                .request_unattached(
+                    &self.tenant,
+                    REVEAL_ACTION,
+                    serde_json::json!({
+                        "object_id": object_id.to_string(),
+                        "object": slug,
+                        "record_id": record_id.to_string(),
+                        "field": field,
+                        "purpose": purpose,
+                    }),
+                    &format!("reveal:{}", Uuid::now_v7()),
+                )
+                .await?;
+        Ok(serde_json::json!({
+            "approval_request_id": req.id,
+            "status": req.status,
+            "expires_at": req.expires_at,
+        }))
+    }
+
+    /// `approvals`: list pending requests, approve or deny one. Owners
+    /// and admins only; the engine refuses a requester deciding their own
+    /// request (four eyes).
+    async fn tool_approvals(&self, args: &Value) -> Result<Value> {
+        check_unknown_keys(args, &["action", "id"], "approvals")?;
+        if !matches!(self.role.as_str(), "owner" | "admin") {
+            return Err(TinkerError::Forbidden(
+                "approvals are decided by owners and admins".into(),
+            ));
+        }
+        let action = require_str(args, "action")?;
+        let engine =
+            tinker_agents::ApprovalEngine::new(self.state.core.clone(), self.state.owner.clone());
+        match action.as_str() {
+            "list" => {
+                let mut tx = self.state.core.tenant_tx(&self.tenant).await?;
+                let rows: Vec<(
+                    Uuid,
+                    String,
+                    Value,
+                    Option<Uuid>,
+                    Option<chrono::DateTime<chrono::Utc>>,
+                )> = sqlx::query_as(
+                    "SELECT id, action_name, payload, requested_by, expires_at \
+                         FROM approval_requests \
+                         WHERE organization_id = $1 AND status = 'pending' \
+                           AND (expires_at IS NULL OR expires_at > now()) \
+                         ORDER BY created_at",
+                )
+                .bind(self.tenant.organization_id.0)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(TinkerError::Db)?;
+                tx.commit().await.map_err(TinkerError::Db)?;
+                let pending: Vec<Value> = rows
+                    .into_iter()
+                    .map(|(id, action, payload, by, exp)| {
+                        serde_json::json!({
+                            "id": id, "action": action, "payload": payload,
+                            "requested_by": by, "expires_at": exp,
+                        })
+                    })
+                    .collect();
+                Ok(serde_json::json!({ "pending": pending }))
+            }
+            "approve" | "deny" => {
+                let id: Uuid = require_str(args, "id")?.parse().map_err(|_| {
+                    TinkerError::Validation("approvals: \"id\" must be a uuid".into())
+                })?;
+                let decided = engine.decide(&self.tenant, id, action == "approve").await?;
+                Ok(serde_json::json!({ "id": id, "status": decided.status }))
+            }
+            other => Err(TinkerError::Validation(format!(
+                "approvals: unknown action '{other}' (list | approve | deny)"
+            ))),
+        }
     }
 
     /// Drop cached query plans that read `object_id`, for this
@@ -1223,6 +1375,8 @@ fn tool_names() -> Vec<&'static str> {
         "reveal",
         "erase",
         "automation",
+        "request_reveal",
+        "approvals",
     ]
 }
 
@@ -1302,13 +1456,31 @@ fn tools_list_result() -> Value {
             ),
             tool(
                 "reveal",
-                "Return the plaintext of ONE sensitive field (describe marks them `sensitive: true`; every other read returns them masked as \"••••••\"). Requires the owner or admin role and a key with the explicit mcp:tool:reveal scope. Every reveal is audited with its purpose. Hidden fields and invisible records are not_found.",
+                "Return the plaintext of ONE sensitive field (describe marks them `sensitive: true`; every other read returns them masked). Needs a pii.reveal approval for exactly this field: file it with request_reveal, have someone else approve it with approvals, then pass its id here — one approval, one reveal. Owner/admin role, explicit mcp:tool:reveal scope; audited with the request's purpose.",
                 obj(serde_json::json!({
                     "object": { "type": "string", "description": "Object api_slug" },
                     "record_id": { "type": "string", "description": "Record UUID" },
                     "field": { "type": "string", "description": "api_name of a sensitive field" },
-                    "purpose": { "type": "string", "description": "Why this value is needed (3-500 chars); stored in the audit trail" }
+                    "approval_request_id": { "type": "string", "description": "An approved pii.reveal request you filed for this field" }
+                }), &["object", "record_id", "field", "approval_request_id"]),
+            ),
+            tool(
+                "request_reveal",
+                "File a pii.reveal approval request for one sensitive field of one record, with the purpose (3-500 chars). A second person approves it via approvals; then call reveal with its id. Owner/admin role, explicit mcp:tool:request_reveal scope.",
+                obj(serde_json::json!({
+                    "object": { "type": "string" },
+                    "record_id": { "type": "string" },
+                    "field": { "type": "string" },
+                    "purpose": { "type": "string" }
                 }), &["object", "record_id", "field", "purpose"]),
+            ),
+            tool(
+                "approvals",
+                "List pending approval requests, or approve / deny one. You can never decide a request you filed. Owner/admin role, explicit mcp:tool:approvals scope.",
+                obj(serde_json::json!({
+                    "action": { "type": "string", "description": "list | approve | deny" },
+                    "id": { "type": "string", "description": "Approval request UUID (approve, deny)" }
+                }), &["action"]),
             ),
             tool(
                 "erase",
@@ -1538,6 +1710,9 @@ fn approval_args(args: &Value) -> Result<(bool, Option<Uuid>)> {
     }
     Ok((require_approval, approval_request_id))
 }
+
+/// Approval action a PII reveal consumes.
+const REVEAL_ACTION: &str = "pii.reveal";
 
 /// One typed `automation` tool argument (with a default when absent).
 fn automation_arg<T: serde::de::DeserializeOwned>(

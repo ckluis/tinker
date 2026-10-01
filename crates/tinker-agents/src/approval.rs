@@ -32,7 +32,9 @@ pub const DEFAULT_ESCALATION_AFTER: std::time::Duration = std::time::Duration::f
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
     pub id: Uuid,
-    pub attachment_id: Uuid,
+    /// The agent attachment that raised the request; `None` for requests
+    /// a person raised directly (e.g. a PII reveal).
+    pub attachment_id: Option<Uuid>,
     pub action_name: String,
     pub payload: serde_json::Value,
     pub idempotency_key: String,
@@ -94,7 +96,7 @@ pub struct ApprovalEngine {
 /// payload, idempotency_key, status, expires_at, escalated_at.
 type ApprovalRow = (
     Uuid,
-    Uuid,
+    Option<Uuid>,
     String,
     serde_json::Value,
     String,
@@ -157,6 +159,47 @@ impl ApprovalEngine {
         &self,
         ctx: &TenantContext,
         attachment_id: Uuid,
+        action_name: &str,
+        payload: serde_json::Value,
+        idempotency_key: &str,
+        ttl: std::time::Duration,
+    ) -> Result<ApprovalRequest> {
+        self.insert_request(
+            ctx,
+            Some(attachment_id),
+            action_name,
+            payload,
+            idempotency_key,
+            ttl,
+        )
+        .await
+    }
+
+    /// A request a person raises directly (no agent attachment), e.g. a
+    /// PII reveal awaiting a second person. Same TTL, idempotency and
+    /// four-eyes rules as attached requests.
+    pub async fn request_unattached(
+        &self,
+        ctx: &TenantContext,
+        action_name: &str,
+        payload: serde_json::Value,
+        idempotency_key: &str,
+    ) -> Result<ApprovalRequest> {
+        self.insert_request(
+            ctx,
+            None,
+            action_name,
+            payload,
+            idempotency_key,
+            DEFAULT_APPROVAL_TTL,
+        )
+        .await
+    }
+
+    async fn insert_request(
+        &self,
+        ctx: &TenantContext,
+        attachment_id: Option<Uuid>,
         action_name: &str,
         payload: serde_json::Value,
         idempotency_key: &str,

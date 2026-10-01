@@ -840,7 +840,7 @@ pub async fn record_automation_event(
 ///
 /// Item 40 (C1): shared with the lifecycle engine — submit_for_review and
 /// publish consume M7 approvals through exactly this path.
-pub(crate) async fn consume_approval(
+pub async fn consume_approval(
     tx: &mut Transaction<'_, Postgres>,
     ctx: &TenantContext,
     require_approval: bool,

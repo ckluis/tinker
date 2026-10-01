@@ -62,7 +62,7 @@ async fn world() -> World {
         .execute(&owner_pool)
         .await
         .unwrap();
-    let mut actor = |role: &'static str| {
+    let actor = |role: &'static str| {
         let pool = owner_pool.clone();
         async move {
             let id = Uuid::now_v7();

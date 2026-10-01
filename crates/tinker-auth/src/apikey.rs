@@ -96,7 +96,13 @@ pub fn validate_scope(scope: &str) -> Result<()> {
 }
 
 /// Tools that `mcp:tools` does not cover: each needs `mcp:tool:<name>`.
-pub const EXPLICIT_ONLY_TOOLS: &[&str] = &["reveal", "erase", "automation"];
+pub const EXPLICIT_ONLY_TOOLS: &[&str] = &[
+    "reveal",
+    "erase",
+    "automation",
+    "request_reveal",
+    "approvals",
+];
 
 /// Does this scope set authorize an MCP method? `initialize`, `ping`,
 /// and notifications need auth only; everything else needs a scope.
