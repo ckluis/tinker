@@ -521,10 +521,13 @@ async fn r3_approval_replay_wrong_action_cross_org() {
     let att_a = attachment(&env, &ctx_a).await;
 
     // --- Replay on the governed-write path: one approval, two creates.
+    // (Decided by a second org-A actor: requesters never decide their own.)
+    let ctx_a_approver =
+        TenantContext::new(OrganizationId(org_a), Uuid::now_v7(), "r3-adv".to_string());
     let appr = request_decided(
         &ap,
         &ctx_a,
-        &ctx_a,
+        &ctx_a_approver,
         att_a,
         "create_record",
         "object_id",
@@ -670,10 +673,13 @@ async fn r3_approval_replay_wrong_action_cross_org() {
 
     // --- Cross-org approval id: B's approval presented to A's publish.
     let att_b = attachment(&env, &ctx_b).await;
+    // (A second org-B actor decides: requesters never decide their own.)
+    let ctx_b_reviewer =
+        TenantContext::new(ctx_b.organization_id, Uuid::now_v7(), "r3-adv".to_string());
     let foreign = request_decided(
         &ap,
         &ctx_b,
-        &ctx_b,
+        &ctx_b_reviewer,
         att_b,
         "publish",
         "draft_id",
@@ -689,10 +695,27 @@ async fn r3_approval_replay_wrong_action_cross_org() {
         "cross-org approval must be rejected, got {err:?}"
     );
 
-    // --- Self-approval at the engine layer (belt-and-braces with m0).
+    // --- Self-approval (belt-and-braces with m0): the engine refuses a
+    // --- requester deciding their own request outright...
+    let own = ap
+        .request(
+            &ctx_a,
+            att_a,
+            "publish",
+            json!({ "draft_id": draft.draft_id.to_string() }),
+            &format!("r3-own-{}", Uuid::now_v7()),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        ap.decide(&ctx_a, own.id, true).await,
+        Err(TinkerError::Forbidden(_))
+    ));
+    // ...and publish refuses an approval the AUTHOR decided, even when a
+    // reviewer queued it.
     let self_appr = request_decided(
         &ap,
-        &ctx_a,
+        &ctx_reviewer,
         &ctx_a,
         att_a,
         "publish",

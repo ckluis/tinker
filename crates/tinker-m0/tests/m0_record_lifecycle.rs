@@ -1496,12 +1496,25 @@ async fn publish_rejects_self_approval_and_bad_approval_states() {
         .await
         .unwrap();
 
-    // Self-approval: the AUTHOR deciding the publish approval must be
-    // rejected, even though the request is otherwise valid.
-    let self_appr = draft_approval(
+    // Four eyes at the engine (migration 0047): the author cannot decide
+    // the approval they requested, in either direction.
+    let own = draft_approval(&ap, &w, &w.ctx_author, draft.draft_id, "publish", None).await;
+    for approve in [true, false] {
+        let err = ap.decide(&w.ctx_author, own, approve).await.unwrap_err();
+        assert!(
+            matches!(&err, TinkerError::Forbidden(m) if m.contains("requester")),
+            "requester self-decision must be refused, got {err:?}"
+        );
+    }
+
+    // Self-approval at publish: someone else requested, but the AUTHOR
+    // decided — still rejected, even though the request is otherwise valid.
+    let self_appr = request_approval(
         &ap,
         &w,
+        &w.ctx_viewer,
         &w.ctx_author,
+        "draft_id",
         draft.draft_id,
         "publish",
         Some(true),

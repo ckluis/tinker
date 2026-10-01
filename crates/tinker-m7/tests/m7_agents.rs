@@ -618,7 +618,10 @@ async fn typed_actions_require_approval_for_external_send() {
         .mark_executed(&env.exec_ctx, req.id)
         .await
         .is_err());
-    let approved = approvals.decide(&env.exec_ctx, req.id, true).await.unwrap();
+    let approved = approvals
+        .decide(&env.employee_ctx, req.id, true)
+        .await
+        .unwrap();
     assert_eq!(approved.status, "approved");
     let executed = approvals
         .mark_executed(&env.exec_ctx, req.id)

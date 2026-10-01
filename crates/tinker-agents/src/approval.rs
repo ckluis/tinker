@@ -39,6 +39,9 @@ pub struct ApprovalRequest {
     pub status: String,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     pub escalated_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// The actor who queued the request; `None` only for rows created
+    /// before requesters were recorded (migration 0047).
+    pub requested_by: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -98,10 +101,11 @@ type ApprovalRow = (
     String,
     Option<chrono::DateTime<chrono::Utc>>,
     Option<chrono::DateTime<chrono::Utc>>,
+    Option<Uuid>,
 );
 
-const ROW_COLUMNS: &str =
-    "id, attachment_id, action_name, payload, idempotency_key, status, expires_at, escalated_at";
+const ROW_COLUMNS: &str = "id, attachment_id, action_name, payload, idempotency_key, status, \
+     expires_at, escalated_at, requested_by";
 
 impl ApprovalEngine {
     pub fn new(core: CoreDb, owner: OwnerDb) -> Self {
@@ -118,6 +122,7 @@ impl ApprovalEngine {
             status: row.5,
             expires_at: row.6,
             escalated_at: row.7,
+            requested_by: row.8,
         }
     }
 
@@ -183,8 +188,9 @@ impl ApprovalEngine {
         }
         let row: ApprovalRow = sqlx::query_as(&format!(
             "INSERT INTO approval_requests
-                 (organization_id, attachment_id, action_name, payload, idempotency_key, expires_at)
-             VALUES ($1, $2, $3, $4, $5, now() + $6::interval)
+                 (organization_id, attachment_id, action_name, payload, idempotency_key, expires_at,
+                  requested_by)
+             VALUES ($1, $2, $3, $4, $5, now() + $6::interval, $7)
              RETURNING {ROW_COLUMNS}",
         ))
         .bind(ctx.organization_id.0)
@@ -193,6 +199,7 @@ impl ApprovalEngine {
         .bind(&payload)
         .bind(idempotency_key)
         .bind(ttl_chrono)
+        .bind(ctx.actor_id)
         .fetch_one(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -248,6 +255,7 @@ impl ApprovalEngine {
                  SET status = $3, decided_by = $4, decided_at = now()
                  WHERE organization_id = $1 AND id = $2 AND status = 'pending'
                    AND (expires_at IS NULL OR expires_at > now())
+                   AND requested_by IS DISTINCT FROM $4
                  RETURNING {ROW_COLUMNS}",
         ))
         .bind(ctx.organization_id.0)
@@ -260,8 +268,8 @@ impl ApprovalEngine {
             tx.commit().await?;
             return Ok(Self::to_request(row));
         }
-        let state: Option<(String,)> = sqlx::query_as(
-            "SELECT status FROM approval_requests
+        let state: Option<(String, Option<Uuid>)> = sqlx::query_as(
+            "SELECT status, requested_by FROM approval_requests
              WHERE organization_id = $1 AND id = $2",
         )
         .bind(ctx.organization_id.0)
@@ -271,10 +279,17 @@ impl ApprovalEngine {
         // Commit, not rollback: the lazy expiry above is a legitimate state
         // transition that must persist even though the decision did not.
         tx.commit().await?;
-        match state.as_ref().map(|s| s.0.as_str()) {
-            Some("expired") => Err(TinkerError::Forbidden(
+        match state.as_ref().map(|s| (s.0.as_str(), s.1)) {
+            Some(("expired", _)) => Err(TinkerError::Forbidden(
                 "approval request expired; queue a new request".into(),
             )),
+            // Four eyes: whoever queued a request can never decide it,
+            // in either direction (a self-denial is as much a decision).
+            Some(("pending", Some(requester))) if requester == ctx.actor_id => {
+                Err(TinkerError::Forbidden(
+                    "the requester cannot decide their own approval request".into(),
+                ))
+            }
             _ => Err(TinkerError::NotFound(
                 "approval request not found or not pending".into(),
             )),

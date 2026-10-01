@@ -102,7 +102,13 @@ async fn approvals_shared_across_instances() {
     let seen = engine_b.get(&ctx, req.id).await.unwrap();
     assert_eq!(seen.id, req.id);
     assert_eq!(seen.status, "pending");
-    let decided = engine_b.decide(&ctx, req.id, true).await.unwrap();
+    // A second actor decides: requesters never decide their own request.
+    let approver = TenantContext::new(
+        ctx.organization_id,
+        Uuid::now_v7(),
+        "scale-out-test".to_string(),
+    );
+    let decided = engine_b.decide(&approver, req.id, true).await.unwrap();
     assert_eq!(decided.status, "approved");
 
     // ...and the decision is visible back on A: no per-instance state.

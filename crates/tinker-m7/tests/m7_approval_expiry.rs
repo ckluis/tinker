@@ -58,7 +58,7 @@ async fn expired_request_cannot_be_decided_or_executed() {
     // Decide fails closed with the expired-specific error, and the row is
     // lazily transitioned to expired.
     let err = approvals
-        .decide(&env.exec_ctx, req.id, true)
+        .decide(&env.employee_ctx, req.id, true)
         .await
         .unwrap_err()
         .to_string();
@@ -123,7 +123,7 @@ async fn sweeper_expires_only_stale_pending_rows() {
 
     // One stale row is already decided — the sweeper must not touch it.
     approvals
-        .decide(&env.exec_ctx, stale2.id, false)
+        .decide(&env.employee_ctx, stale2.id, false)
         .await
         .unwrap_err();
 
@@ -170,7 +170,10 @@ async fn approval_lapsing_between_decide_and_execute_fails_closed() {
         )
         .await
         .unwrap();
-    let approved = approvals.decide(&env.exec_ctx, req.id, true).await.unwrap();
+    let approved = approvals
+        .decide(&env.employee_ctx, req.id, true)
+        .await
+        .unwrap();
     assert_eq!(approved.status, "approved");
 
     // The deadline passes after approval but before execution.
@@ -248,7 +251,10 @@ async fn escalation_surfaces_stale_pending_exactly_once() {
         .is_empty());
 
     // Escalation never changes decidability.
-    let decided = approvals.decide(&env.exec_ctx, req.id, true).await.unwrap();
+    let decided = approvals
+        .decide(&env.employee_ctx, req.id, true)
+        .await
+        .unwrap();
     assert_eq!(decided.status, "approved");
 }
 
@@ -306,4 +312,41 @@ async fn policy_parses_ttl_and_escalation_with_defaults() {
     assert!(p.human_before_external_send);
     assert_eq!(p.ttl_secs, 600);
     assert_eq!(p.escalation_after_secs, 60);
+}
+
+/// Four eyes (migration 0047): the actor who queued a request can never
+/// decide it, approve or deny; a different actor can. The request
+/// records its requester.
+#[tokio::test]
+async fn requester_cannot_decide_their_own_request() {
+    let env = setup().await;
+    let approvals = ApprovalEngine::new(env.core.clone(), env.owner.clone());
+    let req = approvals
+        .request(
+            &env.exec_ctx,
+            env.attachment_id,
+            "email.create_draft",
+            payload(),
+            &format!("four-eyes-{}", uuid::Uuid::now_v7()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(req.requested_by, Some(env.exec_id));
+    for approve in [true, false] {
+        let err = approvals
+            .decide(&env.exec_ctx, req.id, approve)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("requester"), "{err}");
+    }
+    assert_eq!(
+        approvals.get(&env.exec_ctx, req.id).await.unwrap().status,
+        "pending"
+    );
+    let decided = approvals
+        .decide(&env.employee_ctx, req.id, true)
+        .await
+        .unwrap();
+    assert_eq!(decided.status, "approved");
 }
