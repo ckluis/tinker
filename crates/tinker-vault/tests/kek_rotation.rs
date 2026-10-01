@@ -65,7 +65,11 @@ async fn fixture(keks: Vec<(String, Vec<u8>)>) -> Fixture {
 /// Seal a value in the vault and register its opaque token in core, like
 /// the two-phase write in production.
 async fn seal_and_register(fx: &Fixture, plaintext: &str) -> Uuid {
-    let subject = Uuid::now_v7();
+    seal_and_register_for(fx, Uuid::now_v7(), plaintext).await
+}
+
+/// Seal under a given subject (its own DEK) and register the core ref.
+async fn seal_and_register_for(fx: &Fixture, subject: Uuid, plaintext: &str) -> Uuid {
     let ref_id = fx
         .vault
         .seal(&fx.ctx, subject, "pii.name", plaintext)
@@ -112,15 +116,17 @@ async fn dek_versions(fx: &Fixture) -> Vec<(i32, String)> {
 async fn dek_rotation_keeps_old_values_readable() {
     let fx = fixture(vec![("test-kek".to_string(), kek(1))]).await;
 
-    let old_ref = seal_and_register(&fx, "before-rotation").await;
-    let dek_v1 = fx.vault.rotate_dek(&fx.ctx).await.unwrap();
-    let new_ref = seal_and_register(&fx, "after-rotation").await;
+    // DEKs are per subject (crypto-shred): rotation is per subject too.
+    let subject = Uuid::now_v7();
+    let old_ref = seal_and_register_for(&fx, subject, "before-rotation").await;
+    let dek_v1 = fx.vault.rotate_dek(&fx.ctx, subject).await.unwrap();
+    let new_ref = seal_and_register_for(&fx, subject, "after-rotation").await;
 
     // Both values resolve through the audited projector.
     assert_eq!(resolve(&fx, old_ref).await, "before-rotation");
     assert_eq!(resolve(&fx, new_ref).await, "after-rotation");
 
-    // Two DEK versions exist; the rotated one is version 2.
+    // The subject has two DEK versions; the rotated one is version 2.
     let versions = dek_versions(&fx).await;
     assert_eq!(
         versions,
@@ -193,9 +199,10 @@ async fn kek_rotation_rewrap_then_drop_old_kek() {
     assert_eq!(resolve(&fx_b_only, old_ref).await, "pre-kek-rotation");
     let new_ref = seal_and_register(&fx_b_only, "post-kek-rotation").await;
     assert_eq!(resolve(&fx_b_only, new_ref).await, "post-kek-rotation");
+    // Two subjects, one DEK each, both wrapped by kek-b.
     assert_eq!(
         dek_versions(&fx_b_only).await,
-        vec![(1, "kek-b".to_string())]
+        vec![(1, "kek-b".to_string()), (1, "kek-b".to_string())]
     );
 }
 
@@ -203,22 +210,24 @@ async fn kek_rotation_rewrap_then_drop_old_kek() {
 async fn unknown_kek_id_fails_closed() {
     let fx = fixture(vec![("test-kek".to_string(), kek(1))]).await;
 
-    // Simulate a lost KEK: a DEK row whose kek_id no configured KEK has.
-    // Inserted as the latest version so dek() picks it up.
+    // Simulate a lost KEK: the subject's latest DEK row has a kek_id no
+    // configured KEK has.
     let bogus_dek = Uuid::now_v7();
+    let subject = Uuid::now_v7();
     sqlx::query(
-        "INSERT INTO wrapped_deks (id, organization_id, kek_id, wrapped_key, version) \
-         VALUES ($1,$2,'kek-that-does-not-exist', decode('00','hex'), 99)",
+        "INSERT INTO wrapped_deks (id, organization_id, kek_id, wrapped_key, version, subject_id) \
+         VALUES ($1,$2,'kek-that-does-not-exist', decode('00','hex'), 99, $3)",
     )
     .bind(bogus_dek)
     .bind(fx.ctx.organization_id.0)
+    .bind(subject)
     .execute(&fx.pii_owner)
     .await
     .unwrap();
 
     let err = fx
         .vault
-        .seal(&fx.ctx, Uuid::now_v7(), "pii.name", "secret")
+        .seal(&fx.ctx, subject, "pii.name", "secret")
         .await
         .expect_err("unknown kek_id must fail closed");
     let msg = err.to_string();
@@ -232,15 +241,16 @@ async fn unknown_kek_id_fails_closed() {
 async fn concurrent_rotate_dek_never_duplicates_versions() {
     let fx = std::sync::Arc::new(fixture(vec![("test-kek".to_string(), kek(1))]).await);
 
-    // Eight concurrent rotators on one org: the advisory lock serializes
-    // them, so versions must come out exactly 1..=8 with no duplicates
-    // and no unique-violation failures.
+    // Eight concurrent rotators on one subject: the advisory lock
+    // serializes them, so versions must come out exactly 1..=8 with no
+    // duplicates and no unique-violation failures.
+    let subject = Uuid::now_v7();
     let mut handles = Vec::new();
     for _ in 0..8 {
         let fx = fx.clone();
-        handles.push(tokio::spawn(
-            async move { fx.vault.rotate_dek(&fx.ctx).await },
-        ));
+        handles.push(tokio::spawn(async move {
+            fx.vault.rotate_dek(&fx.ctx, subject).await
+        }));
     }
     let mut ids = std::collections::HashSet::new();
     for h in handles {

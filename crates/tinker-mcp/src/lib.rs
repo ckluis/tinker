@@ -954,14 +954,10 @@ impl FrontDoor {
         match action.as_str() {
             "list" => {
                 let mut tx = self.state.core.tenant_tx(&self.tenant).await?;
-                let rows: Vec<(
-                    Uuid,
-                    String,
-                    Value,
-                    Option<Uuid>,
-                    Option<chrono::DateTime<chrono::Utc>>,
-                )> = sqlx::query_as(
-                    "SELECT id, action_name, payload, requested_by, expires_at \
+                let pending: Vec<Value> = sqlx::query_scalar(
+                    "SELECT jsonb_build_object('id', id, 'action', action_name, \
+                            'payload', payload, 'requested_by', requested_by, \
+                            'expires_at', expires_at) \
                          FROM approval_requests \
                          WHERE organization_id = $1 AND status = 'pending' \
                            AND (expires_at IS NULL OR expires_at > now()) \
@@ -972,15 +968,6 @@ impl FrontDoor {
                 .await
                 .map_err(TinkerError::Db)?;
                 tx.commit().await.map_err(TinkerError::Db)?;
-                let pending: Vec<Value> = rows
-                    .into_iter()
-                    .map(|(id, action, payload, by, exp)| {
-                        serde_json::json!({
-                            "id": id, "action": action, "payload": payload,
-                            "requested_by": by, "expires_at": exp,
-                        })
-                    })
-                    .collect();
                 Ok(serde_json::json!({ "pending": pending }))
             }
             "approve" | "deny" => {

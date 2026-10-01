@@ -25,6 +25,10 @@ use tinker_ontology::{FieldDef, FieldType, ObjectDef, Ontology, Scope, Validatio
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
+/// A `pii_values` row as a backup would hold it:
+/// (id, subject_id, storage_class, ciphertext, nonce, wrapped_dek_id).
+type PiiValueRow = (Uuid, Uuid, String, Vec<u8>, Vec<u8>, Uuid);
+
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
 }
@@ -214,8 +218,18 @@ async fn reveal(
     )
     .await?;
     let approver = issue_key(env, org, "admin", &["mcp:tools", "mcp:tool:approvals"]).await;
+    let approver_door = door_for(env, &approver).await;
+    let pending = tool(&approver_door, "approvals", json!({"action": "list"})).await?;
+    let listed = pending["pending"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == req["approval_request_id"])
+        .expect("the pending request is listed for the approver");
+    assert_eq!(listed["action"], "pii.reveal");
+    assert_eq!(listed["payload"]["field"], field);
     tool(
-        &door_for(env, &approver).await,
+        &approver_door,
         "approvals",
         json!({"action": "approve", "id": req["approval_request_id"]}),
     )
@@ -1092,4 +1106,99 @@ async fn reveal_needs_a_fresh_second_person_approval_for_that_field() {
         err.to_string().contains("approved pii.reveal") || err.to_string().contains("already used"),
         "{err}"
     );
+}
+
+/// Crypto-shred (samen parity): erasure destroys the record's DEK, so a
+/// copy of its ciphertext that survives elsewhere — a backup of
+/// pii_values, a replica, an export — can never be decrypted again.
+#[tokio::test]
+async fn erasure_crypto_shreds_copies_of_the_ciphertext() {
+    let env = setup().await;
+    let ctx = new_org(&env).await;
+    let org = ctx.organization_id.0;
+    let (_, slug) = contact_object(&env, &ctx).await;
+    let admin = issue_key(&env, org, "admin", &["mcp:tools", "mcp:tool:erase"]).await;
+    let d = door(&env, &admin, true).await;
+    let id = tool(
+        &d,
+        "create_record",
+        json!({"object": slug, "values": {"email": "shred@me.example"}}),
+    )
+    .await
+    .unwrap()["record_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let rid: Uuid = id.parse().unwrap();
+    let pii_owner = sqlx::PgPool::connect(&std::env::var("TINKER_PII_OWNER_URL").unwrap())
+        .await
+        .unwrap();
+    // "Backup": a copy of the record's ciphertext rows, taken before erasure.
+    let backup: Vec<PiiValueRow> = sqlx::query_as(
+        "SELECT id, subject_id, storage_class, ciphertext, nonce, wrapped_dek_id \
+         FROM pii_values WHERE organization_id = $1 AND subject_id = $2",
+    )
+    .bind(org)
+    .bind(rid)
+    .fetch_all(&pii_owner)
+    .await
+    .unwrap();
+    assert_eq!(
+        backup.len(),
+        1,
+        "one value, sealed under the record's own DEK"
+    );
+    let keys_before: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wrapped_deks WHERE organization_id = $1 AND subject_id = $2",
+    )
+    .bind(org)
+    .bind(rid)
+    .fetch_one(&pii_owner)
+    .await
+    .unwrap();
+    assert_eq!(keys_before, 1);
+
+    tool(
+        &d,
+        "erase",
+        json!({"object": slug, "record_id": id, "purpose": "DSR-shred"}),
+    )
+    .await
+    .unwrap();
+    let keys_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM wrapped_deks WHERE organization_id = $1 AND subject_id = $2",
+    )
+    .bind(org)
+    .bind(rid)
+    .fetch_one(&pii_owner)
+    .await
+    .unwrap();
+    assert_eq!(keys_after, 0, "the subject's DEK is destroyed");
+
+    // Restore the "backup" of the ciphertext: the key it was sealed
+    // under no longer exists anywhere — the database even refuses the
+    // row (pii_values.wrapped_dek_id references wrapped_deks), and
+    // outside the database the bytes are AES-GCM under a destroyed key.
+    let (vid, subject, class, ct, nonce, dek) = backup[0].clone();
+    let restore = sqlx::query(
+        "INSERT INTO pii_values (id, organization_id, subject_id, storage_class, ciphertext, nonce, wrapped_dek_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(vid)
+    .bind(org)
+    .bind(subject)
+    .bind(&class)
+    .bind(&ct)
+    .bind(&nonce)
+    .bind(dek)
+    .execute(&pii_owner)
+    .await;
+    let err = restore.expect_err("a ciphertext whose DEK is shredded cannot come back");
+    assert!(err.to_string().contains("wrapped_dek_id"), "{err}");
+    let dek_anywhere: i64 = sqlx::query_scalar("SELECT count(*) FROM wrapped_deks WHERE id = $1")
+        .bind(dek)
+        .fetch_one(&pii_owner)
+        .await
+        .unwrap();
+    assert_eq!(dek_anywhere, 0);
 }

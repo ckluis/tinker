@@ -218,7 +218,7 @@ pub async fn seed_pii_value(env: &TransferEnv) -> Uuid {
     sqlx::query(
         "INSERT INTO wrapped_deks (id, organization_id, kek_id, wrapped_key, version)
          VALUES ($1, $2, 'test-kek', $3, 1)
-         ON CONFLICT (organization_id, version) DO NOTHING",
+         ON CONFLICT ON CONSTRAINT wrapped_deks_org_subject_version DO NOTHING",
     )
     .bind(dek_id)
     .bind(env.org_id)
@@ -228,7 +228,9 @@ pub async fn seed_pii_value(env: &TransferEnv) -> Uuid {
     .unwrap();
     // Re-read the DEK id in case the conflict branch hit.
     let dek_id: Uuid =
-        sqlx::query_as("SELECT id FROM wrapped_deks WHERE organization_id = $1 AND version = 1")
+        sqlx::query_as(
+            "SELECT id FROM wrapped_deks WHERE organization_id = $1 AND subject_id IS NULL AND version = 1",
+        )
             .bind(env.org_id)
             .fetch_one(&mut *tx)
             .await

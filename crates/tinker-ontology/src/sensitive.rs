@@ -269,9 +269,13 @@ impl PiiSealer {
         refs.extend(by_subject);
         tx.commit().await.map_err(TinkerError::Db)?;
 
-        // Destroy ciphertext first: once it is gone the value is erased
-        // whatever happens to the bookkeeping below.
-        let mut destroyed = 0;
+        // Crypto-shred first: destroy the DEKs of every subject these refs
+        // belong to (and their ciphertext), so any surviving copy of the
+        // values is unreadable. Values under legacy per-organization DEKs
+        // (no subject) are destroyed one by one.
+        let ref_list: Vec<Uuid> = refs.iter().copied().collect();
+        let subjects = self.vault.subjects_of(ctx, &ref_list).await?;
+        let (mut destroyed, _keys) = self.vault.shred_subjects(ctx, &subjects).await?;
         for r in &refs {
             match self.vault.destroy(ctx, *r).await {
                 Ok(()) => destroyed += 1,
@@ -279,6 +283,7 @@ impl PiiSealer {
                 Err(e) => return Err(e),
             }
         }
+        let destroyed = destroyed as usize;
         let mut tx = core.tenant_tx(ctx).await?;
         let ids: Vec<Uuid> = refs.into_iter().collect();
         sqlx::query(
@@ -505,7 +510,7 @@ impl PiiSealer {
             for col in json_cols {
                 let hits: Vec<(Uuid, String, Uuid, String)> = sqlx::query_as(&format!(
                     "SELECT organization_id, {key}, \
-                            COALESCE(record_id, '00000000-0000-0000-0000-000000000000'::uuid), \
+                            COALESCE(record_id, gen_random_uuid()), \
                             {col}->>$2 \
                      FROM {table_name} WHERE object_id IN {objects} \
                        AND jsonb_typeof({col}->$2) = 'string'"

@@ -152,6 +152,7 @@ impl Vault {
         ctx: &TenantContext,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         version: i32,
+        subject: Option<Uuid>,
     ) -> Result<([u8; 32], Uuid)> {
         let mut dek = [0u8; 32];
         OsRng.fill_bytes(&mut dek);
@@ -160,14 +161,15 @@ impl Vault {
         wrapped.extend_from_slice(&ct);
         let id = Uuid::now_v7();
         sqlx::query(
-            "INSERT INTO wrapped_deks (id, organization_id, kek_id, wrapped_key, version) \
-             VALUES ($1,$2,$3,$4,$5)",
+            "INSERT INTO wrapped_deks (id, organization_id, kek_id, wrapped_key, version, subject_id) \
+             VALUES ($1,$2,$3,$4,$5,$6)",
         )
         .bind(id)
         .bind(ctx.organization_id.0)
         .bind(self.current_kek_id())
         .bind(&wrapped)
         .bind(version)
+        .bind(subject)
         .execute(&mut **tx)
         .await?;
         Ok((dek, id))
@@ -177,54 +179,111 @@ impl Vault {
     async fn max_dek_version(
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         org: Uuid,
+        subject: Uuid,
     ) -> Result<i32> {
-        let v: Option<i32> =
-            sqlx::query_scalar("SELECT MAX(version) FROM wrapped_deks WHERE organization_id=$1")
-                .bind(org)
-                .fetch_one(&mut **tx)
-                .await?;
+        let v: Option<i32> = sqlx::query_scalar(
+            "SELECT MAX(version) FROM wrapped_deks WHERE organization_id=$1 AND subject_id=$2",
+        )
+        .bind(org)
+        .bind(subject)
+        .fetch_one(&mut **tx)
+        .await?;
         Ok(v.unwrap_or(0))
     }
 
-    /// Get-or-create the organization's current DEK, unwrapped in memory only.
-    /// Every access is tenant-pinned: RLS on the PII store is the backstop.
-    async fn dek(&self, ctx: &TenantContext) -> Result<([u8; 32], Uuid)> {
-        let mut tx = self.pii.tenant_tx(ctx).await?;
-        Self::lock_deks(&mut tx, ctx.organization_id.0).await?;
-        // Fast path: latest DEK version (re-checked under the lock, so a
-        // concurrent creator's commit is visible here).
-        let row: Option<(Uuid, String, Vec<u8>)> = sqlx::query_as(
-            "SELECT id, kek_id, wrapped_key FROM wrapped_deks \
-             WHERE organization_id=$1 ORDER BY version DESC LIMIT 1",
-        )
-        .bind(ctx.organization_id.0)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some((id, kek_id, wrapped)) = row {
-            tx.commit().await?;
-            let kek = self.kek_for(&kek_id)?;
-            let (nonce, ct) = wrapped.split_at(NONCE_LEN);
-            let raw = open_bytes(kek, nonce, ct)?;
-            let mut k = [0u8; 32];
-            k.copy_from_slice(&raw);
-            return Ok((k, id));
-        }
-        // Create: version 1, wrapped by the current KEK. The wrapped bytes
-        // stored are nonce || ciphertext.
-        let (dek, id) = self.create_dek_version(ctx, &mut tx, 1).await?;
-        tx.commit().await?;
-        Ok((dek, id))
+    fn unwrap_dek(&self, kek_id: &str, wrapped: &[u8]) -> Result<[u8; 32]> {
+        let kek = self.kek_for(kek_id)?;
+        let (nonce, ct) = wrapped.split_at(NONCE_LEN);
+        let raw = open_bytes(kek, nonce, ct)?;
+        let mut k = [0u8; 32];
+        k.copy_from_slice(&raw);
+        Ok(k)
     }
 
-    /// Rotate the organization's DEK: persist a fresh random DEK as the
-    /// next version, wrapped by the current KEK. New seals use it
-    /// immediately; existing values keep resolving through their stored
-    /// `wrapped_dek_id` — no value is re-encrypted.
-    pub async fn rotate_dek(&self, ctx: &TenantContext) -> Result<Uuid> {
+    /// Get-or-create the DEK of one subject (the record a value belongs
+    /// to). Crypto-shred: destroying it ([`Vault::shred_subjects`]) makes
+    /// every value sealed under it unreadable, in any copy.
+    async fn subject_dek(&self, ctx: &TenantContext, subject: Uuid) -> Result<([u8; 32], Uuid)> {
         let mut tx = self.pii.tenant_tx(ctx).await?;
         Self::lock_deks(&mut tx, ctx.organization_id.0).await?;
-        let version = Self::max_dek_version(&mut tx, ctx.organization_id.0).await? + 1;
-        let (_, id) = self.create_dek_version(ctx, &mut tx, version).await?;
+        let row: Option<(Uuid, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, kek_id, wrapped_key FROM wrapped_deks \
+             WHERE organization_id=$1 AND subject_id=$2 ORDER BY version DESC LIMIT 1",
+        )
+        .bind(ctx.organization_id.0)
+        .bind(subject)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let out = match row {
+            Some((id, kek_id, wrapped)) => (self.unwrap_dek(&kek_id, &wrapped)?, id),
+            None => {
+                self.create_dek_version(ctx, &mut tx, 1, Some(subject))
+                    .await?
+            }
+        };
+        tx.commit().await?;
+        Ok(out)
+    }
+
+    /// Crypto-shred: delete every DEK of these subjects (and their
+    /// ciphertext). Returns `(values_deleted, keys_deleted)`. The nil
+    /// subject is never shredded — it is not one record.
+    pub async fn shred_subjects(
+        &self,
+        ctx: &TenantContext,
+        subjects: &[Uuid],
+    ) -> Result<(u64, u64)> {
+        let subjects: Vec<Uuid> = subjects.iter().copied().filter(|s| !s.is_nil()).collect();
+        if subjects.is_empty() {
+            return Ok((0, 0));
+        }
+        let mut tx = self.pii.tenant_tx(ctx).await?;
+        Self::lock_deks(&mut tx, ctx.organization_id.0).await?;
+        let values = sqlx::query(
+            "DELETE FROM pii_values WHERE organization_id = $1 AND subject_id = ANY($2)",
+        )
+        .bind(ctx.organization_id.0)
+        .bind(&subjects)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        let keys = sqlx::query(
+            "DELETE FROM wrapped_deks WHERE organization_id = $1 AND subject_id = ANY($2)",
+        )
+        .bind(ctx.organization_id.0)
+        .bind(&subjects)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        Ok((values, keys))
+    }
+
+    /// Subjects owning these refs (for erasure).
+    pub async fn subjects_of(&self, ctx: &TenantContext, ref_ids: &[Uuid]) -> Result<Vec<Uuid>> {
+        let mut tx = self.pii.tenant_tx(ctx).await?;
+        let subjects: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT subject_id FROM pii_values WHERE organization_id = $1 AND id = ANY($2)",
+        )
+        .bind(ctx.organization_id.0)
+        .bind(ref_ids)
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(subjects)
+    }
+
+    /// Rotate one subject's DEK: persist a fresh random DEK as its next
+    /// version, wrapped by the current KEK. New seals for the subject use
+    /// it immediately; existing values keep resolving through their stored
+    /// `wrapped_dek_id` — no value is re-encrypted.
+    pub async fn rotate_dek(&self, ctx: &TenantContext, subject: Uuid) -> Result<Uuid> {
+        let mut tx = self.pii.tenant_tx(ctx).await?;
+        Self::lock_deks(&mut tx, ctx.organization_id.0).await?;
+        let version = Self::max_dek_version(&mut tx, ctx.organization_id.0, subject).await? + 1;
+        let (_, id) = self
+            .create_dek_version(ctx, &mut tx, version, Some(subject))
+            .await?;
         tx.commit().await?;
         Ok(id)
     }
@@ -278,7 +337,7 @@ impl Vault {
         storage_class: &str,
         plaintext: &str,
     ) -> Result<Uuid> {
-        let (dek, dek_id) = self.dek(ctx).await?;
+        let (dek, dek_id) = self.subject_dek(ctx, subject).await?;
         let (nonce, ct) = seal_bytes(&dek, plaintext.as_bytes())?;
         let id = Uuid::now_v7();
         let mut tx = self.pii.tenant_tx(ctx).await?;
@@ -312,35 +371,87 @@ impl Vault {
         if items.is_empty() {
             return Ok(vec![]);
         }
-        let (dek, dek_id) = self.dek(ctx).await?;
+        let org = ctx.organization_id.0;
+        let mut wanted: Vec<Uuid> = items.iter().map(|(s, _, _)| *s).collect();
+        wanted.sort_unstable();
+        wanted.dedup();
+        let mut tx = self.pii.tenant_tx(ctx).await?;
+        Self::lock_deks(&mut tx, org).await?;
+        // Existing subject DEKs (latest version each), then the missing
+        // ones created in one bulk insert under the same lock.
+        let rows: Vec<(Uuid, Uuid, String, Vec<u8>)> = sqlx::query_as(
+            "SELECT DISTINCT ON (subject_id) subject_id, id, kek_id, wrapped_key \
+             FROM wrapped_deks WHERE organization_id = $1 AND subject_id = ANY($2) \
+             ORDER BY subject_id, version DESC",
+        )
+        .bind(org)
+        .bind(&wanted)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut deks: std::collections::HashMap<Uuid, ([u8; 32], Uuid)> =
+            std::collections::HashMap::with_capacity(wanted.len());
+        for (subject, id, kek_id, wrapped) in rows {
+            deks.insert(subject, (self.unwrap_dek(&kek_id, &wrapped)?, id));
+        }
+        let missing: Vec<Uuid> = wanted
+            .into_iter()
+            .filter(|s| !deks.contains_key(s))
+            .collect();
+        if !missing.is_empty() {
+            let (mut ids, mut wrapped_keys) = (Vec::new(), Vec::new());
+            for subject in &missing {
+                let mut dek = [0u8; 32];
+                OsRng.fill_bytes(&mut dek);
+                let (nonce, ct) = seal_bytes(self.current_kek(), &dek)?;
+                let mut wrapped = nonce;
+                wrapped.extend_from_slice(&ct);
+                let id = Uuid::now_v7();
+                deks.insert(*subject, (dek, id));
+                ids.push(id);
+                wrapped_keys.push(wrapped);
+            }
+            sqlx::query(
+                "INSERT INTO wrapped_deks (id, organization_id, kek_id, wrapped_key, version, subject_id) \
+                 SELECT i, $2, $3, w, 1, s FROM unnest($1::uuid[], $4::bytea[], $5::uuid[]) AS v(i, w, s)",
+            )
+            .bind(&ids)
+            .bind(org)
+            .bind(self.current_kek_id())
+            .bind(&wrapped_keys)
+            .bind(&missing)
+            .execute(&mut *tx)
+            .await?;
+        }
         let mut ids = Vec::with_capacity(items.len());
         let mut subjects = Vec::with_capacity(items.len());
         let mut classes = Vec::with_capacity(items.len());
         let mut cts = Vec::with_capacity(items.len());
         let mut nonces = Vec::with_capacity(items.len());
+        let mut dek_ids = Vec::with_capacity(items.len());
         for (subject, class, plaintext) in items {
+            let (dek, dek_id) = deks[subject];
             let (nonce, ct) = seal_bytes(&dek, plaintext.as_bytes())?;
             ids.push(Uuid::now_v7());
             subjects.push(*subject);
             classes.push(class.clone());
             cts.push(ct);
             nonces.push(nonce);
+            dek_ids.push(dek_id);
         }
-        let mut tx = self.pii.tenant_tx(ctx).await?;
         sqlx::query(
             "INSERT INTO pii_values \
              (id, organization_id, subject_id, storage_class, ciphertext, nonce, wrapped_dek_id) \
-             SELECT i, $2, s, c, ct, n, $7 \
-             FROM unnest($1::uuid[], $3::uuid[], $4::text[], $5::bytea[], $6::bytea[]) \
-                  AS v(i, s, c, ct, n)",
+             SELECT i, $2, s, c, ct, n, d \
+             FROM unnest($1::uuid[], $3::uuid[], $4::text[], $5::bytea[], $6::bytea[], $7::uuid[]) \
+                  AS v(i, s, c, ct, n, d)",
         )
         .bind(&ids)
-        .bind(ctx.organization_id.0)
+        .bind(org)
         .bind(&subjects)
         .bind(&classes)
         .bind(&cts)
         .bind(&nonces)
-        .bind(dek_id)
+        .bind(&dek_ids)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

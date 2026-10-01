@@ -228,12 +228,14 @@ async fn concurrent_first_seals_share_one_dek() {
     let ctx = common::new_org(&env, &common::uniq("org")).await;
     let v = vault(&env);
 
+    // Eight concurrent first seals for ONE subject (DEKs are per subject).
+    let shared_subject = Uuid::now_v7();
     let mut handles = Vec::new();
     for i in 0..8u32 {
         let vv = v.clone();
         let cc = ctx.clone();
         handles.push(tokio::spawn(async move {
-            let subject = Uuid::now_v7();
+            let subject = shared_subject;
             let r = vv
                 .seal(&cc, subject, "pii.name", &format!("Person {i}"))
                 .await
@@ -246,7 +248,7 @@ async fn concurrent_first_seals_share_one_dek() {
         sealed.push(h.await.unwrap());
     }
 
-    // Exactly one DEK was created for the org.
+    // Exactly one DEK was created for the subject.
     let n: i64 = sqlx::query_scalar("SELECT count(*) FROM wrapped_deks WHERE organization_id=$1")
         .bind(ctx.organization_id.0)
         .fetch_one(&env.pii_owner)
