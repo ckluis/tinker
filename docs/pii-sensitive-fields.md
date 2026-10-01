@@ -24,6 +24,8 @@ Status: ACCEPTED 2026-09-30. Decisions D1–D3 were made by the operator; the re
 ## Erasure
 `PiiSealer::erase_record(core, ctx, object, record_id)`, exposed as the MCP `erase` tool (owner/admin, explicit `mcp:tool:erase` scope, purpose audited as `pii.erase`), destroys every vault value for the record (refs referenced by the row, drafts and versions, and refs superseded by updates), tombstones the `pii_refs` rows, and nulls the row's sensitive columns. History rows keep their ref ids, which then resolve to "pii value unavailable".
 
+Erasure also **crypto-shreds** (pii migration 0005): each subject (record) has its own DEK, and erasing the record destroys its subjects' DEKs in `wrapped_deks`. A copy of the record's ciphertext, in a dump or a replica, is then AES-GCM under a key that no longer exists. Two limits remain. A backup that also holds `wrapped_deks` still holds the key, so crypto-shred holds against restored backups only once those backups age out, or when `wrapped_deks` is backed up on a shorter retention than `pii_values`. Values sealed before migration 0005 sit under the organization's legacy DEK (`subject_id IS NULL`); erasure destroys those values row by row but cannot shred that DEK, because other subjects share it.
+
 ## Retrofit: making a populated field sensitive
 `tinker-cli field make-sensitive --object <slug> --field <api_name>` (or `PiiSealer::make_field_sensitive` followed by `IngestPipeline::retrofit_sensitive`):
 1. Inside one owner transaction, with a `SHARE ROW EXCLUSIVE` lock on the data table, every live value is sealed (per row, per org) into a **new** UUID column plus a blind index.

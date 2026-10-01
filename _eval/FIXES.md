@@ -69,3 +69,18 @@ Branch `round-3-remaining` (off `pii-sensitive-fields`). **Full suite: 651 passe
 | Browser test on macOS | Root cause: the full Chrome for Testing app never commits a navigation in headless mode on this macOS. Uses Playwright's `chrome-headless-shell` and starts at the server URL with LNA checks off. Proof directory is configurable (`target/browser-proofs`) | `browser_verifies_schema_builder` passes |
 
 **Product decision still open:** whether the CRM pack's `email`/`phone` should be sensitive by default. Doing so seals them for every tenant (platform fields are shared) and turns off the agents' plaintext per-role transforms (mask, tokenize, bucket) on those fields. The tooling to flip them now exists: `tinker-cli field make-sensitive`.
+
+# Round 4: PII by type, automations, samen parity, 2026-10-01
+
+Branches `pii-by-type` → `automations` (stacked on `round-3-remaining`). **Full suite: 662 passed / 0 failed / 1 ignored**, `pii verify ok`. fmt and clippy `-D warnings` are clean.
+
+| Item | Fix | Test |
+|---|---|---|
+| PII is a type, not an opt-in | `email` and `phone` fields are always sealed (`FieldType::is_pii`, `FieldDef::effective_sensitive`); text opts in. `tinker-cli pii verify\|retrofit\|sweep`; `pii verify` gates `bin/test-mac.sh` | `pii_sensitive`, `pii verify` |
+| Retrofit too slow (over 1 h per 1M rows) | Batched `make_field_sensitive`: 1M rows in 92 s; cleanup on error | retrofit tests |
+| Two-phase vault writes orphan ciphertext on rollback | `pii sweep` (944,553 orphans removed from the dev DB) | `pii verify` |
+| Automations need sealed fields without seeing them | Automation keys (`pk_…`), `field:key` selects, outbox events, `tinker-automate` engine, MCP `automation` tool, background worker. See `docs/automations.md` | `tinker-automate/tests/automations.rs` (5) |
+| Reveal was single-person | `reveal` needs an approved, single-use `pii.reveal` request for that field, decided by someone else (`request_reveal`, `approvals`; migration 0051) | `pii_sensitive::reveal_needs_a_fresh_second_person_approval_for_that_field` |
+| Erasure left ciphertext copies decryptable | Per-subject DEKs (pii migration 0005); erasure destroys the subject's DEKs | `pii_sensitive::erasure_crypto_shreds_copies_of_the_ciphertext` |
+
+**Limits:** backups that contain `wrapped_deks` must age out before crypto-shred holds against them. Values sealed before 0005 sit under a legacy org DEK and are destroyed row by row. The servers queue automation emails but have no real provider. Automation actions are not transactional across a failed run.

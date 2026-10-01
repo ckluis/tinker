@@ -25,4 +25,19 @@ Sensitive fields (`docs/pii-sensitive-fields.md`; every email and phone field) n
 
 ## Samen parity (same branch)
 - **Reveal needs a second person.** `reveal` requires an approved, unexpired, single-use `pii.reveal` approval for exactly that (object, record, field), decided by someone other than the requester. That reuses four-eyes approvals.
-- **Crypto-shred erasure.** Vault DEKs are per subject (the record), not per organization. Erasing a record destroys its subjects' DEKs, so every ciphertext under them, in any copy or backup of `pii_values`, becomes unreadable.
+- **Crypto-shred erasure.** Vault DEKs are per subject (the record), not per organization. Erasing a record destroys its subjects' DEKs, so every ciphertext under them, in any copy of `pii_values`, becomes unreadable. Backups that also contain `wrapped_deks` must age out first; see `docs/pii-sensitive-fields.md`.
+
+## Built (branch `automations`)
+| Piece | Where | Proof |
+|---|---|---|
+| Automation keys; `field:key` selects | `tinker-core/src/blind_index.rs`, `tinker-query` (`finish_key_columns`) | `tinker-automate/tests/automations.rs` |
+| Outbox events from create, update (with changed fields), publish and ingest promotion | `tinker-ontology/src/mutate.rs` (`record_automation_event`), migration 0050 | same |
+| Engine: keyed conditions, `update_record`, `send_email` (vault-resolved recipient), `webhook` (allow-list), depth-3 loop guard, 20/h guessing guard, author's role re-checked per run | `crates/tinker-automate` | 5 tests: sealed conditions route and resolve only at send; saves refuse plaintext paths and non-managers; guessing rate limit; depth limit; author losing the role fails closed |
+| MCP `automation` tool (save/list/enable/disable/runs); background worker in web and MCP servers (`TINKER_AUTOMATIONS=off` disables) | `tinker-mcp`, `tinker-web` (`spawn_automation_worker`) | `mcp_front_door` (12 tools) |
+| Reveal with second-person approval: `request_reveal`, `approvals` (list/approve/deny), `reveal` consumes the approval atomically | `tinker-mcp`, `tinker-agents` (unattached approvals, migration 0051) | `pii_sensitive::reveal_needs_a_fresh_second_person_approval_for_that_field` |
+| Per-subject DEKs and crypto-shred | `tinker-vault`, pii migration 0005, `PiiSealer::erase_record` | `pii_sensitive::erasure_crypto_shreds_copies_of_the_ciphertext`, `kek_rotation`, `m0_pii` |
+
+## Known limits
+- **Email in the servers.** The worker queues `send_email` deliveries but the servers configure no real email provider, so they stay queued. Tests use `FakeEmailProvider`.
+- **Actions are not one transaction.** A run that fails after an earlier action succeeded (for example, a webhook after an update) records `failed`; the earlier action stands, and the run is not retried, so the event is not replayed.
+- **Legacy values.** Values sealed under the organization DEK before per-subject keys are destroyed one by one, not shredded.
