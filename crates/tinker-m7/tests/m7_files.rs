@@ -124,6 +124,49 @@ async fn duplicate_bytes_dedup_to_one_row() {
     assert_eq!(n, 1);
 }
 
+/// Identical bytes are identical content: the stored class only ever
+/// ratchets up. Dedup used to drop a stricter re-declaration, and the
+/// re-upload-after-delete upsert overwrote `restricted` with `none`.
+#[tokio::test]
+async fn pii_class_never_downgrades_for_identical_bytes() {
+    let env = setup().await;
+    let (store, _root) = store_for(&env, "pii-ratchet");
+    let bytes = format!("ratchet {}", uuid::Uuid::now_v7()).into_bytes();
+    let mime = "application/octet-stream";
+
+    let a = store
+        .store(&env.exec_ctx, "a.bin", mime, PiiClass::None, &bytes)
+        .await
+        .unwrap();
+    assert_eq!(a.pii_class, PiiClass::None);
+    // Dedup path: a stricter declaration raises the shared row.
+    let b = store
+        .store(&env.exec_ctx, "b.bin", mime, PiiClass::Restricted, &bytes)
+        .await
+        .unwrap();
+    assert_eq!(b.id, a.id);
+    assert_eq!(b.pii_class, PiiClass::Restricted);
+    // ... and a laxer one afterwards does not lower it.
+    let c = store
+        .store(&env.exec_ctx, "c.bin", mime, PiiClass::None, &bytes)
+        .await
+        .unwrap();
+    assert_eq!(c.pii_class, PiiClass::Restricted);
+
+    // Upsert path: delete, then re-upload declaring `none`.
+    store.delete(&env.exec_ctx, a.id).await.unwrap();
+    let d = store
+        .store(&env.exec_ctx, "d.bin", mime, PiiClass::None, &bytes)
+        .await
+        .unwrap();
+    assert_eq!(d.id, a.id, "re-upload reactivates the same row");
+    assert_eq!(
+        d.pii_class,
+        PiiClass::Restricted,
+        "reactivation must not downgrade"
+    );
+}
+
 #[tokio::test]
 async fn tenant_isolation() {
     let env = setup().await;

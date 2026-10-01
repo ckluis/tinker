@@ -703,19 +703,36 @@ impl FileStore {
             .fetch_optional(&mut *tx)
             .await
             .map_err(TinkerError::Db)?;
-            tx.commit().await?;
             if let Some((id, rname, rmime, size, rsha, _b, pii, created)) = row {
-                let r = Self::row_to_ref(id, rname, rmime, size, rsha, pii, created)?;
+                let mut r = Self::row_to_ref(id, rname, rmime, size, rsha, pii, created)?;
+                // Same bytes, same content: a stricter declaration on the
+                // re-upload must win, never be dropped by the dedup.
+                let raised = pii_class.rank() > r.pii_class.rank();
+                if raised {
+                    sqlx::query(
+                        "UPDATE stored_files SET pii_class = $3 \
+                         WHERE organization_id = $1 AND id = $2",
+                    )
+                    .bind(ctx.organization_id.0)
+                    .bind(id)
+                    .bind(pii_class.as_str())
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(TinkerError::Db)?;
+                    r.pii_class = pii_class;
+                }
+                tx.commit().await?;
                 self.audit(
                     ctx,
                     "file.store",
                     id,
                     "dedup",
-                    serde_json::json!({"sha256": sha256}),
+                    serde_json::json!({"sha256": sha256, "pii_class_raised": raised}),
                 )
                 .await?;
                 return Ok(r);
             }
+            tx.commit().await?;
         }
 
         // Bytes first, then the registry row — a row without bytes is a
@@ -737,7 +754,13 @@ impl FileStore {
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
              ON CONFLICT (organization_id, sha256, byte_size) DO UPDATE
                SET status = 'active', name = EXCLUDED.name,
-                   mime = EXCLUDED.mime, pii_class = EXCLUDED.pii_class,
+                   mime = EXCLUDED.mime,
+                   -- Never downgrade: identical bytes keep the stricter
+                   -- of the stored and the newly declared class.
+                   pii_class = CASE
+                       WHEN array_position(ARRAY['none','pii','restricted'], EXCLUDED.pii_class)
+                          > array_position(ARRAY['none','pii','restricted'], stored_files.pii_class)
+                       THEN EXCLUDED.pii_class ELSE stored_files.pii_class END,
                    -- The bytes were just (re)written to the current
                    -- backend, so the row records where they live now.
                    backend = EXCLUDED.backend
@@ -766,7 +789,7 @@ impl FileStore {
             "file.store",
             id,
             "ok",
-            serde_json::json!({"sha256": sha256, "byte_size": r.byte_size, "mime": mime, "pii_class": pii_class.as_str()}),
+            serde_json::json!({"sha256": sha256, "byte_size": r.byte_size, "mime": mime, "pii_class": r.pii_class.as_str()}),
         )
         .await?;
         Ok(r)
