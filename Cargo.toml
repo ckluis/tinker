@@ -21,6 +21,7 @@ members = [
     "crates/tinker-evolve",
     "crates/tinker-m4",
     "crates/tinker-comms",
+    "crates/tinker-automate",
     "crates/tinker-m5",
     "crates/tinker-ingest",
     "crates/tinker-m6",
@@ -97,6 +98,7 @@ tinker-m2 = { path = "crates/tinker-m2" }
 tinker-packs = { path = "crates/tinker-packs" }
 tinker-evolve = { path = "crates/tinker-evolve" }
 tinker-comms = { path = "crates/tinker-comms" }
+tinker-automate = { path = "crates/tinker-automate" }
 tinker-apps = { path = "crates/tinker-apps" }
 tinker-ingest = { path = "crates/tinker-ingest" }
 tinker-agents = { path = "crates/tinker-agents" }

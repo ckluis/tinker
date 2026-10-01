@@ -2559,6 +2559,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "tinker-automate"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tinker-comms",
+ "tinker-core",
+ "tinker-db",
+ "tinker-durable",
+ "tinker-live",
+ "tinker-ontology",
+ "tinker-query",
+ "tinker-vault",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "tinker-comms"
 version = "0.1.0"
 dependencies = [

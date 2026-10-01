@@ -69,6 +69,7 @@ pub struct TypedField {
 
 #[derive(Debug, Clone)]
 struct ResolvedTarget {
+    object_id: Uuid,
     object_slug: String,
     table: String,
     fields: HashMap<String, TypedField>,
@@ -517,6 +518,7 @@ impl IngestPipeline {
             )));
         }
         Ok(ResolvedTarget {
+            object_id,
             object_slug: target.object_slug.clone(),
             table,
             fields,
@@ -1279,6 +1281,17 @@ impl IngestPipeline {
                 .record_provenance_tx(&mut tx, ctx, record_id, &winners)
                 .await?;
             promoted = 1;
+            // Automation outbox, same transaction as the canonical write.
+            let changed: Vec<String> = winners.iter().map(|w| w.field.clone()).collect();
+            tinker_ontology::mutate::record_automation_event(
+                &mut tx,
+                ctx,
+                target.object_id,
+                record_id,
+                if created == 1 { "created" } else { "updated" },
+                &changed,
+            )
+            .await?;
         }
         // Landing kept the source plaintext only until promotion: replace
         // each promoted sensitive value with its digest marker, in the

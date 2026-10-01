@@ -44,6 +44,10 @@ use uuid::Uuid;
 pub struct SendRequest {
     pub idempotency_key: String,
     pub to_actor: Uuid,
+    /// A recipient address resolved in-process from the payload's
+    /// `vault_to_ref` (a sealed email field, docs/automations.md). `None`:
+    /// deliver to `to_actor`'s address on file.
+    pub to_address: Option<String>,
     pub subject: String,
     pub body: String,
 }
@@ -97,6 +101,7 @@ pub struct FakeEmailProvider {
     log: Mutex<HashMap<String, SendReceipt>>,
     bodies: Mutex<HashMap<String, String>>,
     subjects: Mutex<HashMap<String, String>>,
+    recipients: Mutex<HashMap<String, Option<String>>>,
     actual_sends: AtomicU64,
     mode: Mutex<FakeMode>,
 }
@@ -107,6 +112,7 @@ impl FakeEmailProvider {
             log: Mutex::new(HashMap::new()),
             bodies: Mutex::new(HashMap::new()),
             subjects: Mutex::new(HashMap::new()),
+            recipients: Mutex::new(HashMap::new()),
             actual_sends: AtomicU64::new(0),
             mode: Mutex::new(FakeMode::Normal),
         }
@@ -138,7 +144,21 @@ impl FakeEmailProvider {
         self.subjects.lock().unwrap().get(idempotency_key).cloned()
     }
 
+    /// The resolved recipient address the provider received for a key.
+    pub fn to_address_for(&self, idempotency_key: &str) -> Option<String> {
+        self.recipients
+            .lock()
+            .unwrap()
+            .get(idempotency_key)
+            .cloned()
+            .flatten()
+    }
+
     fn record_send(&self, req: &SendRequest) -> SendReceipt {
+        self.recipients
+            .lock()
+            .unwrap()
+            .insert(req.idempotency_key.clone(), req.to_address.clone());
         let receipt = SendReceipt {
             provider_message_id: format!("fake-{}", req.idempotency_key),
         };
@@ -558,9 +578,24 @@ impl DeliveryWorker {
                 format!("{} notification(s): {}", ids.len(), ids.join(", "))
             }
         };
+        // A sealed recipient (automation send_email) resolves the same
+        // way as the body: in-process, audited, never written back.
+        let to_address = match payload.get("vault_to_ref").and_then(|v| v.as_str()) {
+            Some(ref_id) => {
+                let projector = self.projector.as_ref().ok_or_else(|| {
+                    TinkerError::Internal("email delivery needs a vault projector".into())
+                })?;
+                let rid: Uuid = ref_id
+                    .parse()
+                    .map_err(|_| TinkerError::Validation("bad vault_to_ref".into()))?;
+                Some(projector.resolve(ctx, rid, "delivery").await?)
+            }
+            None => None,
+        };
         Ok(SendRequest {
             idempotency_key: claimed.idempotency_key.clone(),
             to_actor,
+            to_address,
             subject,
             body,
         })

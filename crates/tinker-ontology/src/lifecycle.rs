@@ -1015,6 +1015,16 @@ impl LifecycleEngine {
             },
         )
         .await?;
+        let changed: Vec<String> = content_map.keys().cloned().collect();
+        crate::mutate::record_automation_event(
+            &mut tx,
+            ctx,
+            draft.object_id,
+            record_id,
+            "published",
+            &changed,
+        )
+        .await?;
         tx.commit().await.map_err(TinkerError::Db)?;
         Ok(PublishOutcome {
             record_id,

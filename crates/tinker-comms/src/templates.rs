@@ -829,6 +829,7 @@ impl<P: EmailProvider> TemplateSender<P> {
             .send(&SendRequest {
                 idempotency_key: key,
                 to_actor,
+                to_address: None,
                 subject,
                 body,
             })

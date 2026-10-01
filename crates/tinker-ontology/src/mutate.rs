@@ -642,6 +642,8 @@ impl MutationConnector {
         .await
         .map_err(TinkerError::Db)?;
 
+        let changed: Vec<String> = values.keys().cloned().collect();
+        record_automation_event(&mut tx, ctx, desc.id, record_id, "created", &changed).await?;
         tx.commit().await.map_err(TinkerError::Db)?;
         hooks.after_commit(ctx.organization_id.0, desc.id, &[record_id]);
         Ok(MutationOutcome { record_id, version })
@@ -772,6 +774,14 @@ impl MutationConnector {
         .await
         .map_err(TinkerError::Db)?;
 
+        // "changed" = fields whose stored value actually moved (a sealed
+        // value always moves: a fresh seal is a new ref).
+        let changed: Vec<String> = values
+            .iter()
+            .filter(|(k, v)| before.as_ref().and_then(|b| b.get(k.as_str())) != Some(*v))
+            .map(|(k, _)| k.clone())
+            .collect();
+        record_automation_event(&mut tx, ctx, desc.id, req.record_id, "updated", &changed).await?;
         tx.commit().await.map_err(TinkerError::Db)?;
         hooks.after_commit(ctx.organization_id.0, desc.id, &[req.record_id]);
         Ok(MutationOutcome {
@@ -779,6 +789,47 @@ impl MutationConnector {
             version,
         })
     }
+}
+
+/// Purpose prefix for writes made by an automation action
+/// (`automation:<automation id>:<depth>`, docs/automations.md A8).
+pub const AUTOMATION_PURPOSE_PREFIX: &str = "automation:";
+
+/// Write the automation outbox row for a committed-together mutation:
+/// called inside the mutation's transaction, so the event exists iff the
+/// write does. The chain depth and causing automation come from the
+/// context's purpose when an automation made the write.
+pub async fn record_automation_event(
+    tx: &mut Transaction<'_, Postgres>,
+    ctx: &TenantContext,
+    object_id: Uuid,
+    record_id: Uuid,
+    kind: &str,
+    changed: &[String],
+) -> Result<()> {
+    let (caused_by, depth) = ctx
+        .purpose
+        .strip_prefix(AUTOMATION_PURPOSE_PREFIX)
+        .and_then(|rest| rest.split_once(':'))
+        .and_then(|(id, d)| Some((id.parse::<Uuid>().ok()?, d.parse::<i32>().ok()?)))
+        .map(|(id, d)| (Some(id), d))
+        .unwrap_or((None, 0));
+    sqlx::query(
+        "INSERT INTO automation_events \
+         (organization_id, object_id, record_id, kind, changed, depth, caused_by) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(ctx.organization_id.0)
+    .bind(object_id)
+    .bind(record_id)
+    .bind(kind)
+    .bind(changed)
+    .bind(depth)
+    .bind(caused_by)
+    .execute(&mut **tx)
+    .await
+    .map_err(TinkerError::Db)?;
+    Ok(())
 }
 
 /// Consume one approval for a governed write, atomically with the mutation.
