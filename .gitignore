@@ -1,2 +1,5 @@
 .secrets/
 target/
+.pgdata/
+.devfiles/
+_eval/runs/

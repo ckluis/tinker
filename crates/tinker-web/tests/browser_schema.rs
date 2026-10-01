@@ -26,7 +26,13 @@ use std::time::Duration;
 
 use uuid::Uuid;
 
-const CHROME: &str = "/opt/meta-chromium/chrome";
+/// The cell's Chromium; override with `TINKER_TEST_CHROME` elsewhere
+/// (e.g. a Chrome for Testing binary on macOS).
+const CHROME_DEFAULT: &str = "/opt/meta-chromium/chrome";
+
+fn chrome() -> String {
+    std::env::var("TINKER_TEST_CHROME").unwrap_or_else(|_| CHROME_DEFAULT.into())
+}
 // Deliberately far from the Bocht campaign's :18080 range and from the
 // item-30 scale-out ports (18681/18682).
 const PORT: u16 = 18683;
@@ -302,7 +308,7 @@ async fn browser_verifies_schema_builder() {
     let chrome_profile = proofs.join("chrome-profile");
     let _ = std::fs::remove_dir_all(&chrome_profile);
     let mut chrome = ChromeGuard {
-        child: Command::new(CHROME)
+        child: Command::new(chrome())
             .args([
                 "--headless",
                 "--no-sandbox",
