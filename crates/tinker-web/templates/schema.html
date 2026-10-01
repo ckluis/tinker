@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Schema builder — {{ host_name }}</title>
+<link rel="stylesheet" href="/assets/tinker.css" />
+<style>
+.schema-layout { display: grid; grid-template-columns: 16rem 1fr; gap: 1.5rem; max-width: 72rem; margin: 1.5rem auto; padding: 0 1rem; }
+.obj-list { list-style: none; margin: 0; padding: 0; }
+.obj-list li { margin-bottom: .35rem; }
+.obj-list a { display: block; padding: .45rem .6rem; border: 1px solid #ddd; border-radius: .35rem; text-decoration: none; color: inherit; }
+.obj-list a.sel { border-color: #333; background: #f6f6f6; }
+.chip { display: inline-block; font-size: .72rem; padding: .1rem .45rem; border-radius: 999px; border: 1px solid #bbb; margin-left: .4rem; }
+.chip.draft { background: #fff8e1; } .chip.preview { background: #e3f2fd; }
+.chip.canary { background: #fce4ec; } .chip.active { background: #e8f5e9; }
+.chip.superseded, .chip.rolled_back { background: #f0f0f0; color: #666; }
+table.fields { border-collapse: collapse; width: 100%; margin: .75rem 0; }
+table.fields th, table.fields td { border: 1px solid #ddd; padding: .35rem .6rem; text-align: left; font-size: .85rem; }
+.timeline { list-style: none; padding: 0; }
+.timeline li { padding: .5rem .6rem; border: 1px solid #ddd; border-radius: .35rem; margin-bottom: .4rem; }
+.timeline li.sel { border-color: #333; background: #fafafa; }
+.actions form { display: inline-block; margin: .2rem .3rem .2rem 0; }
+.inline-form { border: 1px solid #ddd; border-radius: .35rem; padding: .8rem; margin: .8rem 0; }
+.inline-form label { display: block; margin: .3rem 0; font-size: .85rem; }
+.inline-form input, .inline-form select { margin-left: .4rem; }
+h2 { margin-top: 1.6rem; } h3 { margin-top: 1.2rem; }
+.muted { color: #666; font-size: .85rem; }
+</style>
+</head>
+<body>
+<header class="app-header">
+  <span class="brand">{{ host_name }}</span>
+  <h1>Schema builder</h1>
+  <span class="version">{% if can_evolve %}builder{% else %}viewer{% endif %}</span>
+</header>
+<div class="schema-layout">
+  <nav>
+    <h2>Objects</h2>
+    <ul class="obj-list">
+    {% for o in objects %}
+      <li><a href="/schema?object={{ o.id }}"{% if selected.is_some() && selected.as_ref().unwrap().id == o.id %} class="sel"{% endif %}>{{ o.name }}<br /><span class="muted">{{ o.api_slug }} · {{ o.fields }} fields · {{ o.versions }} versions{% if let Some(a) = o.active_version %} · <span class="chip active">v{{ a }}</span>{% endif %}</span></a></li>
+    {% endfor %}
+    </ul>
+    {% if !can_evolve %}<p class="muted">You can view schemas. Evolving schema requires the <code>schema:evolve</code> grant.</p>{% endif %}
+  </nav>
+  <main>
+  {% match selected %}
+  {% when Some with (s) %}
+    <h2>{{ s.name }} <span class="muted">{{ s.api_slug }}</span></h2>
+    <p class="muted">Blast radius: {{ s.record_count }} records ·
+    {% if s.referenced_by.is_empty() %}no incoming relations{% else %}referenced by {{ s.referenced_by|join(", ") }}{% endif %}</p>
+
+    <h3>Base fields (pack schema)</h3>
+    <table class="fields">
+      <tr><th>API name</th><th>Type</th><th>Column</th></tr>
+      {% for f in s.base_fields %}<tr><td><code>{{ f.api_name }}</code></td><td>{{ f.field_type }}</td><td><code>{{ f.physical_column }}</code></td></tr>{% endfor %}
+    </table>
+
+    <h3>Versions</h3>
+    {% if can_evolve %}
+    <div class="actions"><form method="post" action="/schema/objects/{{ s.id }}/drafts"><button type="submit">New draft</button></form></div>
+    {% endif %}
+    <ul class="timeline">
+    {% for v in s.versions %}
+      <li{% if v.selected %} class="sel"{% endif %}>
+        <a href="/schema?object={{ s.id }}&version={{ v.id }}"><strong>v{{ v.version_number }}</strong></a>
+        <span class="chip {{ v.status }}">{{ v.status }}</span>
+        {% if let Some(p) = v.parent %}<span class="muted">parent v{{ p }}</span>{% endif %}
+        <span class="muted">{{ v.fields }} evolved fields</span>
+      </li>
+    {% endfor %}
+    </ul>
+    {% if s.versions.is_empty() %}<p class="muted">No versions yet — the pack schema is the active schema.</p>{% endif %}
+
+    {% match s.detail %}
+    {% when Some with (d) %}
+    <h3>Version v{{ d.version_number }} <span class="chip {{ d.status }}">{{ d.status }}</span></h3>
+    {% if !d.cohort.is_empty() %}<p class="muted">Canary cohort: {{ d.cohort|join(", ") }}</p>{% endif %}
+
+    {% if can_evolve %}
+    <div class="actions">
+      {% if d.is_draft %}
+      <form method="post" action="/schema/versions/{{ d.id }}/preview"><button type="submit">Mark preview</button></form>
+      <form method="post" action="/schema/versions/{{ d.id }}/canary"><input name="cohort" placeholder="cohort UUIDs, comma-separated" size="32" /><button type="submit">Mark canary</button></form>
+      {% endif %}
+      {% if d.status == "preview" || d.status == "canary" %}
+      <form method="post" action="/schema/versions/{{ d.id }}/promote"><button type="submit">Promote to active</button></form>
+      {% endif %}
+      {% if d.status == "active" || d.status == "canary" %}
+      <form method="post" action="/schema/versions/{{ d.id }}/rollback"><button type="submit" onclick="return confirm('Roll back v{{ d.version_number }}?')">Roll back</button></form>
+      {% endif %}
+    </div>
+    {% endif %}
+
+    <h3>Evolved fields (this version)</h3>
+    {% if d.evolved_fields.is_empty() %}<p class="muted">None — empty draft.</p>
+    {% else %}
+    <table class="fields">
+      <tr><th>API name</th><th>Type</th><th>Column</th><th>Target</th></tr>
+      {% for f in d.evolved_fields %}<tr><td><code>{{ f.api_name }}</code></td><td>{{ f.field_type }}</td><td><code>{{ f.physical_column }}</code></td><td>{% match f.relation_target %}{% when Some with (t) %}{{ t }}{% when None %}—{% endmatch %}</td></tr>{% endfor %}
+    </table>
+    {% endif %}
+
+    {% if d.is_draft && can_evolve %}
+    <div class="inline-form">
+      <h3>Add field</h3>
+      <form method="post" action="/schema/versions/{{ d.id }}/fields">
+        <label>Name <input name="name" required /></label>
+        <label>API name <input name="api_name" required pattern="[a-z][a-z0-9_]*" /></label>
+        <label>Label <input name="label" required /></label>
+        <label>Type <select name="field_type"><option>text</option><option>number</option><option>boolean</option><option>date</option><option>select</option><option>email</option><option>phone</option><option>url</option></select></label>
+        <button type="submit">Add field</button>
+      </form>
+    </div>
+    <div class="inline-form">
+      <h3>Add relation</h3>
+      <form method="post" action="/schema/versions/{{ d.id }}/relations">
+        <label>Name <input name="name" required /></label>
+        <label>API name <input name="api_name" required pattern="[a-z][a-z0-9_]*" /></label>
+        <label>Label <input name="label" required /></label>
+        <label>Target object <select name="target_object_id">{% for o in objects %}<option value="{{ o.id }}">{{ o.name }}</option>{% endfor %}</select></label>
+        <button type="submit">Add relation</button>
+      </form>
+    </div>
+    {% endif %}
+
+    <h3>Diff <span class="muted">({{ d.diff_from }} → v{{ d.version_number }})</span></h3>
+    <p>
+      {% if d.diff_added.is_empty() && d.diff_removed.is_empty() && d.diff_changed.is_empty() %}
+      <span class="muted">No changes.</span>
+      {% else %}
+      {% if !d.diff_added.is_empty() %}<br />Added: {% for a in d.diff_added %}<code>{{ a }}</code> {% endfor %}{% endif %}
+      {% if !d.diff_removed.is_empty() %}<br />Removed: {% for r in d.diff_removed %}<code>{{ r }}</code> {% endfor %}{% endif %}
+      {% if !d.diff_changed.is_empty() %}<br />Changed: {% for c in d.diff_changed %}<code>{{ c }}</code> {% endfor %}{% endif %}
+      {% endif %}
+    </p>
+
+    <h3>Preview (up to 5 rows)</h3>
+    {% if d.preview_rows.is_empty() %}<p class="muted">No rows or nothing to preview.</p>
+    {% else %}
+    <table class="fields">
+      <tr>{% for c in d.preview_cols %}<th>{{ c }}</th>{% endfor %}</tr>
+      {% for row in d.preview_rows %}<tr>{% for cell in row %}<td>{{ cell }}</td>{% endfor %}</tr>{% endfor %}
+    </table>
+    {% endif %}
+    {% when None %}
+    {% endmatch %}
+  {% when None %}
+    <p class="muted">Select an object to inspect its schema versions.</p>
+  {% endmatch %}
+  </main>
+</div>
+</body>
+</html>

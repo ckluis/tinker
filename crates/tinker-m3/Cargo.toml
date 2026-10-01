@@ -1,0 +1,34 @@
+[package]
+name = "tinker-m3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+tinker-core.workspace = true
+tinker-db.workspace = true
+tinker-auth.workspace = true
+tinker-identity.workspace = true
+tinker-live.workspace = true
+tinker-ontology.workspace = true
+tinker-query.workspace = true
+tinker-search.workspace = true
+tinker-apps.workspace = true
+tinker-packs.workspace = true
+tinker-web.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+[[test]]
+name = "m3_crm_pack"
+path = "tests/m3_crm_pack.rs"
+
+[[test]]
+name = "m3_projections"
+path = "tests/m3_projections.rs"

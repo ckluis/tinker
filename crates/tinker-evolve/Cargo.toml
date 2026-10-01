@@ -1,0 +1,17 @@
+[package]
+name = "tinker-evolve"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tinker-core.workspace = true
+tinker-db.workspace = true
+tinker-ontology.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+sha2.workspace = true

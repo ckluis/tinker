@@ -1,0 +1,44 @@
+# Sample systemd unit: `tinker-mcp serve` (MCP over HTTP/SSE)
+#
+# Install: copy to /etc/systemd/system/tinker-mcp.service,
+# `systemctl daemon-reload`, `systemctl enable --now tinker-mcp`.
+# The binary comes from `cargo build --release -p tinker-mcp`; install
+# it at /opt/tinker/bin/tinker-mcp (NOT from a dev target/ dir).
+#
+# Secrets arrive ONLY via /etc/tinker/tinker-mcp.env (mode 0600,
+# root:tinker). See deploy/env/tinker.env.template for the full list.
+[Unit]
+Description=Tinker MCP front door (HTTP/SSE)
+Documentation=file:///opt/tinker/deploy/README.md
+After=network.target tinker-postgres.service tinker-redis.service
+Wants=tinker-postgres.service tinker-redis.service
+# Don't serve traffic the database cannot back.
+Requires=tinker-postgres.service
+
+[Service]
+Type=simple
+User=tinker
+Group=tinker
+WorkingDirectory=/opt/tinker
+EnvironmentFile=/etc/tinker/tinker-mcp.env
+# Bind loopback only: TLS and the public internet terminate at nginx.
+ExecStart=/opt/tinker/bin/tinker-mcp serve --bind 127.0.0.1:8080
+# Startup needs the DB; fail fast if migrations/connect break.
+Restart=on-failure
+RestartSec=5s
+# File descriptors and logs.
+LimitNOFILE=65536
+StandardOutput=append:/var/log/tinker/tinker-mcp.stdout.log
+StandardError=append:/var/log/tinker/tinker-mcp.stderr.log
+# The app logs to stderr ONLY (stdout is the stdio protocol; in serve
+# mode stdout is unused). Log keys are never logged by the app; the
+# proxy access log records IPs — see the logrotate policy.
+# Sandboxing.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tinker/var /var/log/tinker
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

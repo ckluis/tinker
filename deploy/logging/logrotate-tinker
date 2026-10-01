@@ -1,0 +1,58 @@
+# logrotate policy for Tinker service logs
+#
+# Install: copy to /etc/logrotate.d/tinker, then
+# `logrotate -d /etc/logrotate.d/tinker` to debug (dry run).
+# Covers: tinker-mcp stdout/stderr (systemd StandardOutput/StandardError
+# append), postgres CSV-less stderr logs (the collector already rotates
+# daily — this is the backstop), redis log, nginx vhost logs.
+
+/var/log/tinker/*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    # The services append with O_APPEND, so no signal is needed; copy
+    # then truncate keeps the fd valid without a restart.
+    copytruncate
+    # Keep a month; PII-adjacent access logs age out with the rotation.
+    maxage 60
+    su root tinker
+}
+
+/var/lib/postgresql/16/prod/log/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su postgres postgres
+}
+
+/var/log/redis/tinker-redis.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su redis redis
+}
+
+/var/log/nginx/tinker-mcp*.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    # nginx reopens logs on USR1; no truncation race.
+    postrotate
+        [ -f /var/run/nginx.pid ] && kill -USR1 $(cat /var/run/nginx.pid)
+    endscript
+    su www-data adm
+}

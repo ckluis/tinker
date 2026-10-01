@@ -1,0 +1,55 @@
+[package]
+name = "tinker-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tinker"
+path = "src/main.rs"
+
+[dependencies]
+tinker-core.workspace = true
+tinker-db.workspace = true
+tinker-auth.workspace = true
+tinker-identity.workspace = true
+tinker-apps.workspace = true
+tinker-live.workspace = true
+tinker-ontology.workspace = true
+tinker-query.workspace = true
+tinker-evolve.workspace = true
+tinker-comms.workspace = true
+tinker-search.workspace = true
+tinker-agents.workspace = true
+axum.workspace = true
+tower.workspace = true
+askama.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+sqlx.workspace = true
+tracing.workspace = true
+tokio-stream.workspace = true
+jsonwebtoken.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+tower.workspace = true
+# Item 30: two-process scale-out proof drives real binaries over HTTP.
+reqwest = { workspace = true, features = ["stream"] }
+serde_json.workspace = true
+uuid.workspace = true
+sqlx.workspace = true
+base64.workspace = true
+ed25519-dalek.workspace = true
+tinker-core.workspace = true
+tinker-db.workspace = true
+tinker-auth.workspace = true
+tinker-identity.workspace = true
+# Item 30: redis ping + rand only used by the two-process scale-out test.
+redis.workspace = true
+rand.workspace = true
+# Item 34: pack seeding for the browser verification of the schema builder.
+tinker-packs.workspace = true

@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en" data-org="{{ org_slug }}" data-app-version="{{ version_number }}">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>{{ app_name }} — {{ brand }}</title>
+<link rel="stylesheet" href="/assets/tinker.css" />
+<style>
+  :root { --accent: {{ accent }}; }
+</style>
+</head>
+<body>
+<header class="app-header">
+  <span class="brand">{{ brand }}</span>
+  <h1>{{ app_name }}</h1>
+  <span class="version">v{{ version_number }}</span>
+</header>
+<main class="app-grid" style="{{ grid_style }}">
+{% for c in components %}
+<{{ c.tag }} id="{{ c.id }}" class="component" style="{{ c.layout_style }}"
+    data-events='{{ c.events_json }}'>
+{{ c.inner_html|safe }}
+</{{ c.tag }}>
+{% endfor %}
+</main>
+<script type="module">
+  import { load } from '/assets/datastar.js';
+  load();
+</script>
+<script src="/assets/tinker.js"></script>
+</body>
+</html>

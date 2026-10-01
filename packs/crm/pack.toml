@@ -1,0 +1,168 @@
+# Tinker CRM pack (M3): the common portfolio ontology for customer
+# relationships. Installed once as platform objects; each organization
+# gets the dashboard app in its own workspace with its own data.
+[pack]
+id = "crm"
+version = "1.0.0"
+name = "CRM"
+
+[[objects]]
+name = "Company"
+api_slug = "crm_company"
+label = "Company"
+
+[[objects.fields]]
+name = "name"
+api_name = "name"
+label = "Name"
+field_type = "text"
+
+[[objects.fields]]
+name = "industry"
+api_name = "industry"
+label = "Industry"
+field_type = "text"
+
+[[objects.fields]]
+name = "size"
+api_name = "size"
+label = "Size"
+field_type = "select"
+options = ["startup", "smb", "enterprise"]
+
+[[objects]]
+name = "Contact"
+api_slug = "crm_contact"
+label = "Contact"
+
+[[objects.fields]]
+name = "name"
+api_name = "name"
+label = "Name"
+field_type = "text"
+
+[[objects.fields]]
+name = "email"
+api_name = "email"
+label = "Email"
+field_type = "email"
+
+[[objects.fields]]
+name = "phone"
+api_name = "phone"
+label = "Phone"
+field_type = "phone"
+
+[[objects.fields]]
+name = "title"
+api_name = "title"
+label = "Title"
+field_type = "text"
+
+[[objects.fields]]
+name = "company"
+api_name = "company"
+label = "Company"
+field_type = "relation"
+relation_target = "crm_company"
+
+[[objects]]
+name = "Deal"
+api_slug = "crm_deal"
+label = "Deal"
+
+[[objects.fields]]
+name = "name"
+api_name = "name"
+label = "Name"
+field_type = "text"
+
+[[objects.fields]]
+name = "amount"
+api_name = "amount"
+label = "Amount"
+field_type = "currency"
+
+[[objects.fields]]
+name = "stage"
+api_name = "stage"
+label = "Stage"
+field_type = "select"
+options = ["lead", "qualified", "proposal", "won", "lost"]
+
+[[objects.fields]]
+name = "contact"
+api_name = "contact"
+label = "Contact"
+field_type = "relation"
+relation_target = "crm_contact"
+
+[[objects.fields]]
+name = "company"
+api_name = "company"
+label = "Company"
+field_type = "relation"
+relation_target = "crm_company"
+
+[[objects.fields]]
+name = "notes"
+api_name = "notes"
+label = "Notes"
+field_type = "richtext"
+
+# The dashboard app. rt-grid queries reference pack objects by
+# `from_slug`; the installer rewrites them to installed object ids.
+[[apps]]
+slug = "crm-dashboard"
+name = "CRM Dashboard"
+
+[apps.definition.layout]
+type = "grid"
+columns = 12
+rowHeight = 48
+gap = 12
+
+[[apps.definition.components]]
+id = "contacts-grid"
+type = "rt-grid"
+
+[apps.definition.components.layout]
+x = 0
+y = 0
+w = 12
+h = 4
+
+[apps.definition.components.props]
+columns = [
+  { label = "Name", field = "name" },
+  { label = "Email", field = "email" },
+  { label = "Company", field = "company.name" },
+]
+
+[apps.definition.components.props.query]
+from_slug = "crm_contact"
+select = ["name", "email", "company.name"]
+limit = 50
+
+[[apps.definition.components]]
+id = "deals-grid"
+type = "rt-grid"
+
+[apps.definition.components.layout]
+x = 0
+y = 4
+w = 12
+h = 4
+
+[apps.definition.components.props]
+columns = [
+  { label = "Deal", field = "name" },
+  { label = "Amount", field = "amount" },
+  { label = "Stage", field = "stage" },
+  { label = "Contact", field = "contact.name" },
+]
+
+[apps.definition.components.props.query]
+from_slug = "crm_deal"
+select = ["name", "amount", "stage", "contact.name"]
+limit = 50

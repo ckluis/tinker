@@ -1,0 +1,104 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tinker-core",
+    "crates/tinker-db",
+    "crates/tinker-auth",
+    "crates/tinker-durable",
+    "crates/tinker-ontology",
+    "crates/tinker-query",
+    "crates/tinker-search",
+    "crates/tinker-vault",
+    "crates/tinker-identity",
+    "crates/tinker-live",
+    "crates/tinker-apps",
+    "crates/tinker-web",
+    "crates/tinker-m0",
+    "crates/tinker-m1",
+    "crates/tinker-m2",
+    "crates/tinker-packs",
+    "crates/tinker-m3",
+    "crates/tinker-evolve",
+    "crates/tinker-m4",
+    "crates/tinker-comms",
+    "crates/tinker-m5",
+    "crates/tinker-ingest",
+    "crates/tinker-m6",
+    "crates/tinker-agents",
+    "crates/tinker-m7",
+    "crates/tinker-mcp",
+    "crates/tinker-transfer",
+    "crates/tinker-m8",
+]
+default-members = [
+    "crates/tinker-core",
+    "crates/tinker-db",
+    "crates/tinker-auth",
+    "crates/tinker-durable",
+    "crates/tinker-ontology",
+    "crates/tinker-query",
+    "crates/tinker-search",
+    "crates/tinker-vault",
+    "crates/tinker-identity",
+    "crates/tinker-apps",
+    "crates/tinker-web",
+    "crates/tinker-evolve",
+    "crates/tinker-comms",
+    "crates/tinker-m5",
+    "crates/tinker-ingest",
+    "crates/tinker-agents",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/tinker-platform/tinker"
+
+[workspace.dependencies]
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "io-std", "io-util", "fs"] }
+sqlx = { version = "0.8", features = ["postgres", "runtime-tokio-rustls", "uuid", "chrono", "json", "migrate"] }
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+serde = { version = "1", features = ["derive"] }
+toml = { version = "0.8", features = ["parse"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+bigdecimal = "0.4"
+regex = "1"
+tokio-stream = { version = "0.1", features = ["sync"] }
+redis = { version = "1", features = ["tokio-comp"] }
+axum = { version = "0.8", features = ["json", "form", "macros"] }
+tower = { version = "0.5", features = ["util"] }
+askama = "0.12"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+jsonwebtoken = "9"
+base64 = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tinker-core = { path = "crates/tinker-core" }
+tinker-db = { path = "crates/tinker-db" }
+tinker-auth = { path = "crates/tinker-auth" }
+tinker-durable = { path = "crates/tinker-durable" }
+tinker-ontology = { path = "crates/tinker-ontology" }
+tinker-query = { path = "crates/tinker-query" }
+tinker-search = { path = "crates/tinker-search" }
+tinker-vault = { path = "crates/tinker-vault" }
+tinker-identity = { path = "crates/tinker-identity" }
+tinker-live = { path = "crates/tinker-live" }
+tinker-m2 = { path = "crates/tinker-m2" }
+tinker-packs = { path = "crates/tinker-packs" }
+tinker-evolve = { path = "crates/tinker-evolve" }
+tinker-comms = { path = "crates/tinker-comms" }
+tinker-apps = { path = "crates/tinker-apps" }
+tinker-ingest = { path = "crates/tinker-ingest" }
+tinker-agents = { path = "crates/tinker-agents" }
+tinker-transfer = { path = "crates/tinker-transfer" }
+tinker-web = { path = "crates/tinker-web" }
+
+[profile.dev]
+opt-level = 0

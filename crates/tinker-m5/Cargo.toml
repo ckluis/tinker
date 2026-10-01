@@ -1,0 +1,29 @@
+[package]
+name = "tinker-m5"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tinker-core.workspace = true
+tinker-db.workspace = true
+tinker-ontology.workspace = true
+tinker-comms.workspace = true
+tinker-identity.workspace = true
+tinker-live.workspace = true
+tinker-search.workspace = true
+tinker-durable.workspace = true
+tinker-vault.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tinker-auth.workspace = true
+tinker-web.workspace = true
