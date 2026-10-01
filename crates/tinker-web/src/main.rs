@@ -123,6 +123,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if oidc_client.is_some() {
         eprintln!("oidc code flow enabled");
     }
+    // Automations: drain the outbox every 2s (TINKER_AUTOMATIONS=off disables).
+    tinker_web::spawn_automation_worker(state.clone(), std::time::Duration::from_secs(2));
     let app = build_router_with_oidc(state, oidc_client);
 
     eprintln!("tinker listening on {addr}");

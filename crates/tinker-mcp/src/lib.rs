@@ -391,6 +391,7 @@ impl FrontDoor {
             "render_dashboard" => self.tool_render_dashboard(&args).await,
             "reveal" => self.tool_reveal(&args).await,
             "erase" => self.tool_erase(&args).await,
+            "automation" => self.tool_automation(&args).await,
             _ => {
                 return rpc_error_value(
                     ERR_INVALID_PARAMS,
@@ -611,6 +612,70 @@ impl FrontDoor {
         match rows.into_iter().next() {
             Some(row) => Ok(serde_json::json!({ "record": row })),
             None => Err(TinkerError::NotFound(format!("record {record_id}"))),
+        }
+    }
+
+    /// `automation`: save / list / enable / disable / runs over the
+    /// automation engine. The engine enforces owner/admin and every
+    /// sealed-field rule; this only maps arguments.
+    async fn tool_automation(&self, args: &Value) -> Result<Value> {
+        check_unknown_keys(
+            args,
+            &[
+                "action",
+                "object",
+                "name",
+                "trigger",
+                "conditions",
+                "actions",
+                "id",
+                "limit",
+            ],
+            "automation",
+        )?;
+        let action = require_str(args, "action")?;
+        let engine = &self.state.automations;
+        let id = || -> Result<Uuid> {
+            require_str(args, "id")?
+                .parse()
+                .map_err(|_| TinkerError::Validation("automation: \"id\" must be a uuid".into()))
+        };
+        match action.as_str() {
+            "save" => {
+                let slug = require_str(args, "object")?;
+                let def = tinker_automate::AutomationDef {
+                    object_id: self.object_id(&slug).await?,
+                    name: require_str(args, "name")?,
+                    trigger: automation_arg(args, "trigger", Value::Null)?,
+                    conditions: automation_arg(args, "conditions", serde_json::json!([]))?,
+                    actions: automation_arg(args, "actions", serde_json::json!([]))?,
+                };
+                let saved = engine.save(&self.tenant, def).await?;
+                serde_json::to_value(saved).map_err(TinkerError::Serde)
+            }
+            "list" => {
+                let object_id = match args.get("object").and_then(|v| v.as_str()) {
+                    Some(slug) => Some(self.object_id(slug).await?),
+                    None => None,
+                };
+                let list = engine.list(&self.tenant, object_id).await?;
+                Ok(serde_json::json!({ "automations": list }))
+            }
+            "enable" | "disable" => {
+                let id = id()?;
+                engine
+                    .set_enabled(&self.tenant, id, action == "enable")
+                    .await?;
+                Ok(serde_json::json!({ "id": id, "enabled": action == "enable" }))
+            }
+            "runs" => {
+                let limit = args.get("limit").and_then(|v| v.as_i64()).unwrap_or(50);
+                let runs = engine.runs(&self.tenant, id()?, limit).await?;
+                Ok(serde_json::json!({ "runs": runs }))
+            }
+            other => Err(TinkerError::Validation(format!(
+                "automation: unknown action '{other}' (save | list | enable | disable | runs)"
+            ))),
         }
     }
 
@@ -1157,6 +1222,7 @@ fn tool_names() -> Vec<&'static str> {
         "render_dashboard",
         "reveal",
         "erase",
+        "automation",
     ]
 }
 
@@ -1252,6 +1318,20 @@ fn tools_list_result() -> Value {
                     "record_id": { "type": "string", "description": "Record UUID" },
                     "purpose": { "type": "string", "description": "Why (3-500 chars), e.g. the erasure request id; stored in the audit trail" }
                 }), &["object", "record_id", "purpose"]),
+            ),
+            tool(
+                "automation",
+                "Manage automations (docs/automations.md). action: save | list | enable | disable | runs. Conditions on sensitive fields take plaintext values that are hashed into keys on save (never stored); only eq/ne/in/is_set/is_empty/changed apply to them. Actions: update_record {values}, send_email {to_field, subject, body} (recipient resolved from the vault at send), webhook {url, fields} (sensitive fields arrive as keys). Owner/admin role and the explicit mcp:tool:automation scope.",
+                obj(serde_json::json!({
+                    "action": { "type": "string", "description": "save | list | enable | disable | runs" },
+                    "object": { "type": "string", "description": "Object api_slug (save; optional filter for list)" },
+                    "name": { "type": "string", "description": "save" },
+                    "trigger": { "type": "object", "description": "{\"on\": \"record_created\" | \"record_updated\" (+ \"fields\") | \"record_published\"}" },
+                    "conditions": { "type": "array", "description": "[{field, op, value?}]" },
+                    "actions": { "type": "array", "description": "[{type: update_record|send_email|webhook, ...}]" },
+                    "id": { "type": "string", "description": "Automation UUID (enable, disable, runs)" },
+                    "limit": { "type": "integer", "description": "runs: how many (default 50)" }
+                }), &["action"]),
             ),
             tool(
                 "render_dashboard",
@@ -1457,6 +1537,16 @@ fn approval_args(args: &Value) -> Result<(bool, Option<Uuid>)> {
         ));
     }
     Ok((require_approval, approval_request_id))
+}
+
+/// One typed `automation` tool argument (with a default when absent).
+fn automation_arg<T: serde::de::DeserializeOwned>(
+    args: &Value,
+    key: &str,
+    default: Value,
+) -> Result<T> {
+    serde_json::from_value(args.get(key).cloned().unwrap_or(default))
+        .map_err(|e| TinkerError::Validation(format!("automation: bad \"{key}\": {e}")))
 }
 
 fn draft_json(draft: &tinker_ontology::lifecycle::Draft) -> Value {

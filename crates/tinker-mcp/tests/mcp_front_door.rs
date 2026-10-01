@@ -519,7 +519,7 @@ async fn grant_machine_role_roundtrip() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn tools_list_advertises_the_nine_tools() {
+async fn tools_list_advertises_the_ten_tools() {
     let env = setup().await;
     let ctx = new_org(&env).await;
     let door = full_door(&env, ctx.organization_id.0).await;
@@ -537,10 +537,11 @@ async fn tools_list_advertises_the_nine_tools() {
         // Sensitive fields: the explicit-scope plaintext and erasure paths.
         "reveal",
         "erase",
+        "automation",
     ] {
         assert!(names.contains(&want), "tool {want} advertised: {names:?}");
     }
-    assert_eq!(names.len(), 9);
+    assert_eq!(names.len(), 10);
     for t in tools {
         assert!(t["inputSchema"].is_object(), "{} has schema", t["name"]);
     }
@@ -1490,9 +1491,9 @@ async fn pipe_full_conversation() {
     .unwrap();
     pipe.stdin.flush().unwrap();
 
-    // tools/list → nine tools (seven + `reveal` + `erase`).
+    // tools/list → ten tools (seven + `reveal` + `erase` + `automation`).
     let resp = pipe_send(&mut pipe, "tools/list", 2, json!({}));
-    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 9);
+    assert_eq!(resp["result"]["tools"].as_array().unwrap().len(), 10);
 
     // tools/call describe → the catalog carries this org's object.
     let resp = pipe_send(

@@ -13,6 +13,7 @@ tinker-core.workspace = true
 tinker-db.workspace = true
 tinker-auth.workspace = true
 tinker-ontology.workspace = true
+tinker-automate.workspace = true
 tinker-query.workspace = true
 tinker-live.workspace = true
 tinker-agents.workspace = true

@@ -19,6 +19,7 @@ tinker-ontology.workspace = true
 tinker-query.workspace = true
 tinker-evolve.workspace = true
 tinker-comms.workspace = true
+tinker-automate.workspace = true
 tinker-search.workspace = true
 tinker-agents.workspace = true
 axum.workspace = true

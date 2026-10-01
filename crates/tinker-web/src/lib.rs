@@ -98,6 +98,8 @@ pub struct AppState {
     /// WebAuthn relying party (RP ID + allowed origins) for passkey
     /// registration; login verification uses the adapter's own copy.
     pub rp: tinker_auth::webauthn::RelyingParty,
+    /// Automations over sealed fields (docs/automations.md).
+    pub automations: Arc<tinker_automate::AutomationEngine>,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -641,6 +643,11 @@ pub fn build_state_with_pii(
     pii: Option<tinker_ontology::sensitive::PiiSealer>,
 ) -> SharedState {
     let host_for_rp = host_name.clone();
+    let (core_for_auto, owner_for_auto, pii_for_auto) = (
+        tinker_db::CoreDb(tenant_pool.clone()),
+        tinker_db::OwnerDb(system_pool.clone()),
+        pii.clone(),
+    );
     let core = tinker_db::CoreDb(tenant_pool.clone());
     let owner = tinker_db::OwnerDb(system_pool.clone());
     let signals = SignalBus::new();
@@ -695,5 +702,27 @@ pub fn build_state_with_pii(
         owner: tinker_db::OwnerDb(system_pool),
         pii,
         rp: tinker_auth::webauthn::RelyingParty::from_env(&host_for_rp),
+        automations: Arc::new(
+            tinker_automate::AutomationEngine::new(core_for_auto, owner_for_auto, pii_for_auto)
+                .with_webhook_policy(tinker_automate::WebhookPolicy::from_env()),
+        ),
     })
+}
+
+/// Drive automations in the background: every `every`, process pending
+/// outbox events for all organizations. `TINKER_AUTOMATIONS=off` disables
+/// the loop (events stay queued in the outbox, nothing is lost).
+pub fn spawn_automation_worker(state: SharedState, every: std::time::Duration) {
+    if std::env::var("TINKER_AUTOMATIONS").as_deref() == Ok("off") {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        loop {
+            tick.tick().await;
+            if let Err(e) = state.automations.run_pending(200).await {
+                tracing::warn!(error = %e, "automation worker pass failed");
+            }
+        }
+    });
 }

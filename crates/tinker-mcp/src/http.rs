@@ -566,6 +566,7 @@ pub async fn serve(bind: &str) -> Result<(), String> {
         .map_err(|e| format!("pii vault: {e}"))?;
     let (shared_state, mutator, lifecycle) =
         build_services_with_pii(core.0.clone(), owner.0.clone(), pii).map_err(|e| e.to_string())?;
+    tinker_web::spawn_automation_worker(shared_state.clone(), std::time::Duration::from_secs(2));
     let sessions: Arc<RwLock<HashMap<String, Arc<Session>>>> =
         Arc::new(RwLock::new(HashMap::new()));
     tokio::spawn(sweep_loop(sessions.clone()));

@@ -849,3 +849,80 @@ async fn sensitive_fields_select_as_stable_keys() {
         "{err}"
     );
 }
+
+/// The `automation` tool end to end: explicit scope, a sealed-field
+/// condition stored and listed as a key, and the run visible through
+/// the same tool after the worker drains the outbox.
+#[tokio::test]
+async fn automation_tool_saves_keys_and_reports_runs() {
+    let env = setup().await;
+    let ctx = new_org(&env).await;
+    let (_, slug) = contact_object(&env, &ctx).await;
+    let blanket = issue_key(&env, ctx.organization_id.0, "admin", &["mcp:tools"]).await;
+    let def = json!({
+        "action": "save", "object": slug, "name": "flag VIP",
+        "trigger": {"on": "record_created"},
+        "conditions": [{"field": "email", "op": "eq", "value": "vip@corp.example"}],
+        "actions": [{"type": "update_record", "values": {"name": "VIP"}}]
+    });
+    let err = tool(&door(&env, &blanket, true).await, "automation", def.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err["code"], -32001,
+        "mcp:tools does not cover automation: {err}"
+    );
+
+    let admin = issue_key(
+        &env,
+        ctx.organization_id.0,
+        "admin",
+        &["mcp:tools", "mcp:tool:automation"],
+    )
+    .await;
+    let d = door(&env, &admin, true).await;
+    let saved = tool(&d, "automation", def).await.unwrap();
+    assert!(
+        saved["conditions"][0]["value"]
+            .as_str()
+            .unwrap()
+            .starts_with("pk_"),
+        "{saved}"
+    );
+    let listed = tool(&d, "automation", json!({"action": "list", "object": slug}))
+        .await
+        .unwrap();
+    assert!(!listed.to_string().contains("corp.example"), "{listed}");
+
+    let rec = tool(
+        &d,
+        "create_record",
+        json!({"object": slug, "values": {"name": "x", "email": "VIP@corp.example"}}),
+    )
+    .await
+    .unwrap()["record_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let sealer = sealer_from_env().await.unwrap();
+    tinker_automate::AutomationEngine::new(
+        env.core.clone(),
+        OwnerDb(env.core_owner.clone()),
+        sealer,
+    )
+    .run_pending_org(ctx.organization_id.0, 100)
+    .await
+    .unwrap();
+    let runs = tool(
+        &d,
+        "automation",
+        json!({"action": "runs", "id": saved["id"]}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(runs["runs"][0]["outcome"], "succeeded", "{runs}");
+    let got = tool(&d, "get_record", json!({"object": slug, "record_id": rec}))
+        .await
+        .unwrap();
+    assert_eq!(got["record"]["name"], "VIP");
+}
