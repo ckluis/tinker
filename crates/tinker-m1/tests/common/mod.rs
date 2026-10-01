@@ -268,7 +268,7 @@ pub async fn setup() -> Env {
         .await
         .expect("app-role connect");
 
-    let run: String = Uuid::now_v7().simple().to_string()[..8].into();
+    let run: String = Uuid::now_v7().simple().to_string()[24..32].into(); // random tail: the v7 head is the timestamp
     let host_id = Uuid::now_v7();
     sqlx::query!(
         "INSERT INTO hosts (id, name) VALUES ($1, $2)",

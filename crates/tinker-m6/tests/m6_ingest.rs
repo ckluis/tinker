@@ -1974,7 +1974,7 @@ async fn infra_failure_fails_run_loudly() {
     // run, so nothing else can observe it.
     let slug = format!(
         "infra_probe_{}",
-        &uuid::Uuid::now_v7().simple().to_string()[..12]
+        &uuid::Uuid::now_v7().simple().to_string()[20..32] // random tail, not the v7 timestamp head
     );
     let pack_toml = format!(
         "[pack]\nid = \"infra-probe\"\nversion = \"1.0.0\"\nname = \"InfraProbe\"\n\n\

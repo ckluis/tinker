@@ -49,7 +49,7 @@ async fn wait_for_lock_waiter(owner: &sqlx::PgPool, timeout: Duration) {
 /// A minimal one-object pack. The slug carries a random suffix because
 /// platform slugs are global and persist in the shared test database.
 fn test_pack(pack_id: &str) -> PackDefinition {
-    let rand: String = uuid::Uuid::now_v7().simple().to_string()[..12].to_string();
+    let rand: String = uuid::Uuid::now_v7().simple().to_string()[20..32].to_string(); // random tail, not the v7 timestamp head
     let slug = format!("lock_scope_{}_{}", pack_id.replace('-', "_"), rand);
     let toml = format!(
         "[pack]\nid = \"{pack_id}\"\nversion = \"1.0.0\"\nname = \"LockScope\"\n\n\

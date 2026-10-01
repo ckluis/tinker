@@ -42,8 +42,11 @@ async fn setup() -> (PackInstaller, Ontology, sqlx::PgPool, sqlx::PgPool) {
     (installer, ontology, owner_pool, tenant_pool)
 }
 
+/// The LAST 12 hex chars: the first 12 of a v7 UUID are the millisecond
+/// timestamp, so parallel tests started in the same ms shared a tag (and
+/// a pack slug) and flaked.
 fn rand_tag() -> String {
-    Uuid::now_v7().simple().to_string()[..12].to_string()
+    Uuid::now_v7().simple().to_string()[20..32].to_string()
 }
 
 /// Two-object pack: widget (text + two selects + relation) and gadget.
