@@ -17,6 +17,11 @@ export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PA
 bin/dev-db-mac.sh >/dev/null || { echo "test-mac: dev-db failed" >&2; exit 1; }
 eval "$(bin/dev-db-mac.sh env)"
 export DATABASE_URL="$TINKER_CORE_OWNER_URL"
+# ~90 test binaries with full debug info + incremental caches reached
+# 22GB of target/ and filled the disk (2026-09-30). Test runs need
+# neither: line tables keep panic locations, and no incremental cache.
+export CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=line-tables-only
 
 REDIS_PORT=16390
 if ! redis-cli -p "$REDIS_PORT" ping >/dev/null 2>&1; then

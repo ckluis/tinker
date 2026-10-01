@@ -36,7 +36,7 @@ One Cargo workspace (`crates/`), layered:
   `tinker-packs`, `tinker-transfer`): HTTP API, app rendering, ingestion
   (incl. AI-assisted mapping proposals), schema evolution, durable workflows.
 - **Agent front door** (`tinker-mcp`, `tinker describe`): MCP over stdio and
-  HTTP/SSE, 7 tools + `tinker://ontology/{slug}` resources, `tk_` machine-key
+  HTTP/SSE, 8 tools (incl. the explicit-scope `reveal`) + `tinker://ontology/{slug}` resources, `tk_` machine-key
   auth. Post-M8 items 43–49 added: self-describing ontology, version-matched
   skill, MCP server, HTTP/SSE transport, measured single-server efficiency,
   embedding-based semantic ranking, AI mapping proposals.
@@ -52,8 +52,12 @@ One Cargo workspace (`crates/`), layered:
 3. Writes go through governed paths only: validation + presets, lifecycle
    state machines (draft → review → publish) with approvals bound to
    (action, draft_id) — approvals can't be replayed across actions.
-4. PII fields are sealed into the vault (per-org DEK, KEK-wrapped); the app
-   only ever sees ciphertext or masked values.
+4. Fields declared `sensitive: true` (text/email/phone) are sealed into the
+   vault (per-org DEK, KEK-wrapped) before any copy is made. Core holds only
+   a ref + keyed blind index, every read returns a mask, exact-match lookups
+   use the blind index, and plaintext comes only from the audited `reveal`
+   tool. Fields NOT declared sensitive are ordinary plaintext columns.
+   See docs/pii-sensitive-fields.md.
 5. Fail-closed everywhere: missing TIN extension, unconfigured embedding
    provider, or dead OIDC → loud typed errors, never silent fallback.
 

@@ -30,3 +30,26 @@ Every fix ships with a regression test. "Proven" means the test was run with the
 - **Self-approval of generic approvals.** `approval_requests` has no requester column; `publish` already enforces a second person.
 - **OIDC bare `id_token` login / non-WebAuthn passkeys labelled MFA.** Needs a login-flow redesign.
 - **Browser test on macOS.** Chrome path is now configurable (`TINKER_TEST_CHROME`); the CDP driver still times out on `Page.enable` with Chrome for Testing.
+
+# Round 2: sensitive fields (PII vault wired), 2026-09-30
+
+Branch `pii-sensitive-fields` (off `round-1-pg18-hardening`). Design + decisions: `docs/pii-sensitive-fields.md` (D1 `sensitive` flag, D2 masked reads + audited `reveal`, D3 exact-match blind index, all chosen by Chris).
+
+| Piece | Where | Test |
+|---|---|---|
+| `sensitive` flag (text/email/phone only, no presets, base objects only), migration 0046, UUID ref column + `__bidx` column + index | `tinker-ontology/src/lib.rs`, `0046_sensitive_fields.sql`, `tinker-evolve` (refuses), `tinker-packs` (TOML flag; flip = drift) | `pii_sensitive::sensitive_definitions_are_validated`, `drift_repair::pack_sensitive_field_installs_sealed_and_flip_is_drift` |
+| Blind index: HMAC-SHA256(key, org ‖ field ‖ normalized value), separate `TINKER_BLIND_INDEX_KEY` | `tinker-core/src/blind_index.rs` | unit tests (scoping, normalization, key parsing) |
+| Seal-at-entry on every governed write: MutationConnector create/update, lifecycle create_draft/update_draft (caller values only), publish carries the sealed form; `pii_refs` committed in the same core tx | `tinker-ontology/src/{sensitive,mutate,lifecycle}.rs` | `pii_sensitive::sensitive_values_are_sealed_masked_findable_and_revealable` (no plaintext in row / audit), `m0_record_lifecycle::sensitive_fields_stay_sealed_through_drafts_and_versions` |
+| Masked reads in the compiler (all query consumers + caches see `••••••`); eq/ne/in via blind index; other operators, sorting and row policies on sensitive fields refused | `tinker-query/src/{lib,row_policy}.rs` | same MCP test |
+| `reveal` MCP tool: owner/admin, **explicit** `mcp:tool:reveal` scope (blanket `mcp:tools` does not cover it), purpose 3–500 chars, field projection + row policy first, audited by the vault projector | `tinker-mcp/src/lib.rs`, `tinker-auth/src/apikey.rs` | `pii_sensitive::reveal_is_gated_by_role_scope_and_tenant` |
+| Smuggling a copied sealed form is rejected; a server without a vault refuses sensitive writes | `sensitive::seal_values` | `pii_sensitive::sealed_forms_cannot_be_smuggled_and_no_vault_fails_closed` |
+| Erasure: destroys every ref (row, versions, drafts, superseded-by-update), tombstones `pii_refs`, nulls the columns | `PiiSealer::erase_record` | both end-to-end tests |
+| Servers load the vault from env (all three vars set → on; none → off, fail closed; partial → startup error) | `tinker-web/src/main.rs`, `tinker-mcp/src/{main,http}.rs` | dev env now sets all three |
+
+**Proven:** with masking removed, the MCP test fails (and the read showed the vault **ref**, not the email: the UUID column is a structural guard on its own). With `reveal` not explicit-only, the gating test fails. With caller sealed forms accepted, the smuggling test fails.
+
+**Also fixed on the way:** `deploy/env/tinker.env.template` documented `TINKER_KEK` as base64, but the vault only parses hex, so a deploy following the template could not start.
+
+**Disk:** a full workspace test build reached 22 GB in `target/` and filled the disk. `bin/test-mac.sh` now builds with `CARGO_INCREMENTAL=0` and line-table debug info (about 4 GB).
+
+**Not in this round:** ingest/comms writers into sensitive columns (they fail closed on the UUID type, so the CRM pack's email/phone are deliberately NOT marked sensitive until ingest seals); toggling `sensitive` on a populated field; an MCP-exposed erasure tool.

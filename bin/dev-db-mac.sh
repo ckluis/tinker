@@ -46,9 +46,16 @@ TINKER_CORE_URL=postgres://tinker_app:$(pw)@127.0.0.1:$PORT/tinker_core
 TINKER_PII_OWNER_URL=postgres://tinker_pii:$(pw)@127.0.0.1:$PORT/tinker_pii
 TINKER_PII_URL=postgres://tinker_pii_app:$(pw)@127.0.0.1:$PORT/tinker_pii
 TINKER_KEK=$(openssl rand -hex 32)
+TINKER_BLIND_INDEX_KEY=$(openssl rand -hex 32)
 TINKER_FILE_ROOT=$HERE/.devfiles
 EOF
   echo "dev-db: wrote $SECRETS"
+fi
+# Keys added after a secrets file was first written (sensitive fields:
+# docs/pii-sensitive-fields.md). Appended once, never rotated here.
+if ! grep -q '^TINKER_BLIND_INDEX_KEY=' "$SECRETS"; then
+  echo "TINKER_BLIND_INDEX_KEY=$(openssl rand -hex 32)" >> "$SECRETS"
+  echo "dev-db: added TINKER_BLIND_INDEX_KEY to $SECRETS"
 fi
 set -a; . "$SECRETS"; set +a
 pw_of() { printf '%s' "$1" | sed -n 's|.*://[^:]*:\([^@]*\)@.*|\1|p'; }
