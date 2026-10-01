@@ -671,13 +671,22 @@ pub fn build_state_with_pii(
         compiler,
         evolver: tinker_evolve::SchemaEvolver::new(core.clone(), owner.clone(), ontology.clone()),
         ontology: ontology.clone(),
-        executor: QueryExecutor::new(core.clone()),
+        executor: match &pii {
+            Some(p) => QueryExecutor::new(core.clone()).with_keys(p.blind_index().clone()),
+            None => QueryExecutor::new(core.clone()),
+        },
         cache,
         meta,
         signals: signals.clone(),
         grants: tinker_live::FieldGrants::new(core.clone()),
         row_filters: tinker_query::RowFilters::new(core.clone()),
-        dashboards: tinker_query::dashboard::DashboardService::new(core.clone(), ontology.clone()),
+        dashboards: {
+            let d = tinker_query::dashboard::DashboardService::new(core.clone(), ontology.clone());
+            match &pii {
+                Some(p) => d.with_blind_index(p.blind_index().clone()),
+                None => d,
+            }
+        },
         core: core.clone(),
         // M5: the comms writer publishes into the same signal bus the SSE
         // endpoint reads, so posted messages fan out as id-only envelopes.

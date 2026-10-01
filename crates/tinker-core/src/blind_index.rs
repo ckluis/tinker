@@ -71,6 +71,29 @@ impl BlindIndexKey {
     }
 }
 
+/// Prefix of an automation key (docs/automations.md, A1).
+pub const AUTOMATION_KEY_PREFIX: &str = "pk_";
+
+impl BlindIndexKey {
+    /// The key people and integrations see for a sealed value: derived
+    /// from its blind-index digest under a separate HMAC domain, so it is
+    /// stable per (org, field, normalized value) — usable for equality,
+    /// grouping and change detection — but cannot be matched against the
+    /// blind-index column itself.
+    pub fn automation_key(&self, bidx_hex: &str) -> String {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.0).expect("HMAC takes any key length");
+        mac.update(b"tinker-automation-key-v1");
+        mac.update(bidx_hex.as_bytes());
+        let hex: String = mac
+            .finalize()
+            .into_bytes()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        format!("{AUTOMATION_KEY_PREFIX}{}", &hex[..40])
+    }
+}
+
 /// Exact-match normalization: what counts as "the same value" for a
 /// lookup. Trimmed always; emails case-folded; phones reduced to `+` and
 /// digits so formatting differences do not split matches.
@@ -116,6 +139,26 @@ mod tests {
         assert_ne!(
             key().digest(org, field, "text", "Maya"),
             key().digest(org, field, "text", "maya")
+        );
+    }
+
+    #[test]
+    fn automation_keys_are_stable_and_separate_from_the_index() {
+        let (org, field) = (Uuid::from_u128(1), Uuid::from_u128(3));
+        let bidx = key().digest(org, field, "email", "maya@example.com");
+        let k = key().automation_key(&bidx);
+        assert!(k.starts_with("pk_") && k.len() == 43, "{k}");
+        assert_eq!(
+            k,
+            key().automation_key(&key().digest(org, field, "email", " Maya@Example.com"))
+        );
+        assert!(
+            !bidx.contains(&k[3..]),
+            "key is not a slice of the index digest"
+        );
+        assert_ne!(
+            k,
+            key().automation_key(&key().digest(org, field, "email", "other@example.com"))
         );
     }
 

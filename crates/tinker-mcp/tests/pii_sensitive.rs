@@ -800,3 +800,52 @@ async fn erase_tool_destroys_sensitive_values_under_the_same_gate() {
         "{meta}"
     );
 }
+
+/// `field:key` (docs/automations.md, A1): a sealed field can be selected
+/// as its automation key — stable per value, equal for equal values,
+/// never the plaintext and never the raw blind-index digest.
+#[tokio::test]
+async fn sensitive_fields_select_as_stable_keys() {
+    let env = setup().await;
+    let ctx = new_org(&env).await;
+    let (_, slug) = contact_object(&env, &ctx).await;
+    let admin = issue_key(&env, ctx.organization_id.0, "admin", &["mcp:tools"]).await;
+    let d = door(&env, &admin, true).await;
+    for (n, e) in [
+        ("A", "same@x.example"),
+        ("B", " SAME@x.example "),
+        ("C", "other@x.example"),
+    ] {
+        tool(
+            &d,
+            "create_record",
+            json!({"object": slug, "values": {"name": n, "email": e}}),
+        )
+        .await
+        .unwrap();
+    }
+    let q = tool(
+        &d,
+        "query",
+        json!({"object": slug, "intent": {"select": ["name", "email:key"], "order": [{"field": "name", "descending": false}]}}),
+    )
+    .await
+    .unwrap();
+    let rows = q["rows"].as_array().unwrap();
+    let key = |i: usize| rows[i]["email:key"].as_str().unwrap().to_string();
+    assert!(key(0).starts_with("pk_") && key(0).len() == 43, "{q}");
+    assert_eq!(key(0), key(1), "equal values share a key (normalized)");
+    assert_ne!(key(0), key(2));
+    assert!(!q.to_string().contains("x.example"), "{q}");
+    let err = tool(
+        &d,
+        "query",
+        json!({"object": slug, "intent": {"select": ["name:key"]}}),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.to_string().contains("only sensitive fields have keys"),
+        "{err}"
+    );
+}

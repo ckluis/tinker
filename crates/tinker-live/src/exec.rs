@@ -29,11 +29,18 @@ pub const STREAM_CHUNK: i64 = 500;
 
 pub struct QueryExecutor {
     core: CoreDb,
+    keys: Option<std::sync::Arc<tinker_core::blind_index::BlindIndexKey>>,
 }
 
 impl QueryExecutor {
     pub fn new(core: CoreDb) -> Self {
-        Self { core }
+        Self { core, keys: None }
+    }
+
+    /// Derive automation keys for `field:key` selects (docs/automations.md).
+    pub fn with_keys(mut self, key: tinker_core::blind_index::BlindIndexKey) -> Self {
+        self.keys = Some(std::sync::Arc::new(key));
+        self
     }
 
     /// Hash identifying a plan + its bound values. The cache key pairs
@@ -107,7 +114,9 @@ impl QueryExecutor {
 
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
-            out.push(row_to_json(&plan.output_fields, r));
+            let mut row = row_to_json(&plan.output_fields, r);
+            tinker_query::finish_key_columns(&mut row, self.keys.as_deref());
+            out.push(row);
         }
 
         // Audit in the same tenant context: attribution cannot cross orgs.
@@ -139,8 +148,9 @@ impl QueryExecutor {
         let core = self.core.clone();
         let ctx = ctx.clone();
         let plan = plan.clone();
+        let keys = self.keys.clone();
         tokio::spawn(async move {
-            drive_stream(core, ctx, plan, tx_out).await;
+            drive_stream(core, ctx, plan, tx_out, keys).await;
         });
         RowStream { rx }
     }
@@ -171,6 +181,7 @@ async fn drive_stream(
     ctx: TenantContext,
     plan: CompiledPlan,
     out: tokio::sync::mpsc::Sender<Result<serde_json::Value>>,
+    keys: Option<std::sync::Arc<tinker_core::blind_index::BlindIndexKey>>,
 ) {
     let started = std::time::Instant::now();
 
@@ -227,7 +238,11 @@ async fn drive_stream(
         for r in &rows {
             row_count += 1;
             if out
-                .send(Ok(row_to_json(&plan.output_fields, r)))
+                .send(Ok({
+                    let mut row = row_to_json(&plan.output_fields, r);
+                    tinker_query::finish_key_columns(&mut row, keys.as_deref());
+                    row
+                }))
                 .await
                 .is_err()
             {

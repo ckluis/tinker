@@ -137,6 +137,28 @@ impl FieldProjection {
     }
 }
 
+/// Select suffix for a sensitive field's key (`email:key`).
+pub const KEY_SUFFIX: &str = ":key";
+
+/// Turn the blind-index digests a compiled plan selects under `field:key`
+/// into automation keys (docs/automations.md, A1). Every row decoder runs
+/// this before a row leaves the process: the raw digest is never handed
+/// out. Without a key configured the column is null, never the digest.
+pub fn finish_key_columns(row: &mut serde_json::Value, key: Option<&BlindIndexKey>) {
+    let Some(map) = row.as_object_mut() else {
+        return;
+    };
+    for (name, v) in map.iter_mut() {
+        if !name.ends_with(KEY_SUFFIX) {
+            continue;
+        }
+        *v = match (v.as_str(), key) {
+            (Some(bidx), Some(k)) => serde_json::Value::String(k.automation_key(bidx)),
+            _ => serde_json::Value::Null,
+        };
+    }
+}
+
 pub struct QueryCompiler {
     ontology: Ontology,
     evolver: Option<SchemaEvolver>,
@@ -302,6 +324,32 @@ impl QueryCompiler {
         let mut select_cols: Vec<(String, String)> = Vec::new(); // (sql expr, api_name)
         let mut joins: Vec<Join> = Vec::new();
         for api_name in &intent.select {
+            // `field:key` (docs/automations.md, A1): a sensitive field's
+            // stable key instead of its value. The compiler emits the
+            // blind-index digest under that output name; surfaces derive
+            // the automation key from it before anything leaves the
+            // process. Same projection as the field itself.
+            if let Some(base_field) = api_name.strip_suffix(KEY_SUFFIX) {
+                let (owner, leaf) = self.field_owner(ctx, base, base_field, version_sel).await?;
+                if !projection.allows(owner, &leaf) {
+                    continue;
+                }
+                let sf = self
+                    .sensitive_at(ctx, base, base_field, version_sel)
+                    .await?
+                    .ok_or_else(|| {
+                        TinkerError::Validation(format!(
+                            "'{api_name}': only sensitive fields have keys"
+                        ))
+                    })?;
+                let (expr, _) = self
+                    .resolve_select(ctx, base, base_field, &mut joins, version_sel)
+                    .await?;
+                let phys = format!("\"{}\"", sf.physical_column);
+                let bidx = format!("\"{}\"", tinker_ontology::bidx_column(&sf.physical_column));
+                select_cols.push((expr.replacen(&phys, &bidx, 1), api_name.clone()));
+                continue;
+            }
             let (owner, leaf) = self.field_owner(ctx, base, api_name, version_sel).await?;
             if !projection.allows(owner, &leaf) {
                 continue;

@@ -135,9 +135,18 @@ pub struct DashboardService {
     ontology: Ontology,
     compiler: QueryCompiler,
     row_filters: RowFilters,
+    keys: Option<std::sync::Arc<tinker_core::blind_index::BlindIndexKey>>,
 }
 
 impl DashboardService {
+    /// Sensitive-field lookups in panels (blind index) and `field:key`
+    /// selects (automation keys).
+    pub fn with_blind_index(mut self, key: tinker_core::blind_index::BlindIndexKey) -> Self {
+        self.compiler = self.compiler.with_blind_index(key.clone());
+        self.keys = Some(std::sync::Arc::new(key));
+        self
+    }
+
     pub fn new(core: CoreDb, ontology: Ontology) -> Self {
         let compiler = QueryCompiler::new(ontology.clone());
         let row_filters = RowFilters::new(core.clone());
@@ -145,6 +154,7 @@ impl DashboardService {
             core,
             ontology,
             compiler,
+            keys: None,
             row_filters,
         }
     }
@@ -574,7 +584,9 @@ impl DashboardService {
         let rows = q.fetch_all(&mut *tx).await.map_err(TinkerError::Db)?;
         let mut out = Vec::with_capacity(rows.len());
         for r in &rows {
-            out.push(row_to_json(&plan.output_fields, r));
+            let mut row = row_to_json(&plan.output_fields, r);
+            crate::finish_key_columns(&mut row, self.keys.as_deref());
+            out.push(row);
         }
         let ms = started.elapsed().as_millis() as i32;
         let hash = plan_hash(plan);
