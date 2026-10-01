@@ -147,7 +147,7 @@ async fn cross_organization_app_slug_is_invisible() {
     assert!(!html.contains("B SECRET"));
 
     // Org B itself renders it fine.
-    let cookie_b = oidc_login(&env.router, &env.org_b).await;
+    let cookie_b = oidc_login(&env, &env.org_b).await;
     let res = get_with_cookie(&env.router, "/apps/b-secret", &cookie_b).await;
     assert_eq!(res.status(), StatusCode::OK);
     assert!(body_text(res).await.contains("B SECRET"));

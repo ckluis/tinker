@@ -13,7 +13,8 @@ use tinker_apps::{
 };
 use tinker_auth::{AuthBroker, OidcAdapter, OidcConfig, OidcKey, PasskeyAdapter};
 use tinker_identity::{Authorizer, PgOidcBindingStore, PgPasskeyStore, SessionManager};
-use tinker_web::{build_router, build_state, SharedState};
+use tinker_web::oidc_flow::OidcClient;
+use tinker_web::{build_router_with_oidc, build_state, SharedState};
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set"))
@@ -46,7 +47,102 @@ pub struct Env {
     pub org_a: OrgCtx,
     pub org_b: OrgCtx,
     pub run: String,
+    /// The OIDC provider the router's code flow talks to.
+    pub idp: FakeIdp,
 }
+
+/// A minimal OIDC provider for the code flow: the test plays the user's
+/// browser by registering (code -> id_token, PKCE challenge) with
+/// [`FakeIdp::authorize`]; the token endpoint verifies the PKCE verifier
+/// against that challenge and hands back the token, once.
+#[derive(Clone)]
+pub struct FakeIdp {
+    pub base: String,
+    codes: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, (String, String)>>>,
+}
+
+#[allow(dead_code)]
+impl FakeIdp {
+    pub async fn start() -> Self {
+        let codes: std::sync::Arc<
+            std::sync::Mutex<std::collections::HashMap<String, (String, String)>>,
+        > = Default::default();
+        let state = codes.clone();
+        let app = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move |body: String| {
+                let codes = state.clone();
+                async move {
+                    let form: std::collections::HashMap<String, String> = body
+                        .split('&')
+                        .filter_map(|kv| kv.split_once('='))
+                        .map(|(k, v)| (k.to_string(), percent_decode(v)))
+                        .collect();
+                    let code = form.get("code").cloned().unwrap_or_default();
+                    let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+                    let Some((token, challenge)) = codes.lock().unwrap().remove(&code) else {
+                        return (StatusCode::BAD_REQUEST, "unknown code".to_string());
+                    };
+                    if tinker_web::oidc_flow::pkce_challenge(&verifier) != challenge {
+                        return (StatusCode::BAD_REQUEST, "pkce mismatch".to_string());
+                    }
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({ "id_token": token, "token_type": "Bearer" })
+                            .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        Self { base, codes }
+    }
+
+    /// The user approved at the provider: `code` will redeem `id_token`
+    /// for a client presenting the verifier behind `challenge`.
+    pub fn authorize(&self, code: &str, id_token: String, challenge: &str) {
+        self.codes
+            .lock()
+            .unwrap()
+            .insert(code.to_string(), (id_token, challenge.to_string()));
+    }
+
+    pub fn client(&self) -> OidcClient {
+        OidcClient {
+            authorization_endpoint: "https://idp.m1.test/authorize".into(),
+            token_endpoint: format!("{}/token", self.base),
+            client_id: "tinker-m1".into(),
+            client_secret: None,
+            redirect_uri: "https://tinker.test/login/oidc/callback".into(),
+        }
+    }
+}
+
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8(out).unwrap()
+}
+
+/// Nonce used by tests that call the adapter directly (no login attempt).
+#[allow(dead_code)]
+pub const TEST_NONCE: &str = "m1-test-nonce";
 
 #[allow(dead_code)]
 fn oidc_test_pem() -> Vec<u8> {
@@ -78,8 +174,14 @@ pub fn oidc_config() -> OidcConfig {
     }
 }
 
+/// An ID token answering a login attempt whose nonce is [`TEST_NONCE`].
 #[allow(dead_code)]
 pub fn mint_id_token(subject: &str, audience: &str, exp_secs: i64) -> String {
+    mint_id_token_for(subject, audience, exp_secs, TEST_NONCE)
+}
+
+#[allow(dead_code)]
+pub fn mint_id_token_for(subject: &str, audience: &str, exp_secs: i64, nonce: &str) -> String {
     let exp = (chrono::Utc::now() + chrono::Duration::seconds(exp_secs)).timestamp();
     let claims = serde_json::json!({
         "iss": "https://issuer.m1.test",
@@ -87,6 +189,7 @@ pub fn mint_id_token(subject: &str, audience: &str, exp_secs: i64) -> String {
         "aud": audience,
         "exp": exp,
         "iat": exp - 60,
+        "nonce": nonce,
     });
     jsonwebtoken::encode(
         &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256),
@@ -344,9 +447,11 @@ pub async fn setup() -> Env {
         "tinker.test".into(),
         false,
     );
-    let router = build_router(state);
+    let idp = FakeIdp::start().await;
+    let router = build_router_with_oidc(state, Some(idp.client()));
 
     Env {
+        idp,
         router,
         tenant,
         system,
@@ -411,27 +516,74 @@ pub async fn passkey_login(router: &axum::Router, org: &OrgCtx) -> String {
     extract_cookie(&res)
 }
 
-/// OIDC login over HTTP. Returns the session cookie value.
-/// Shared login helper; not every suite exercises OIDC.
+/// One run of the OIDC code flow over HTTP, with the test playing the
+/// browser and the provider: start → (provider issues `make_token(nonce)`
+/// for a fresh code bound to the PKCE challenge) → callback. Returns the
+/// callback response and the attempt's `state` (for replay tests).
 #[allow(dead_code)]
-pub async fn oidc_login(router: &axum::Router, org: &OrgCtx) -> String {
-    let body = serde_json::json!({
-        "organization_id": org.org_id.to_string(),
-        "workspace_id": org.workspace_id.to_string(),
-        "id_token": mint_id_token(&org.oidc_subject, "tinker-m1", 300),
-    });
-    let res = router
+pub async fn oidc_flow(
+    env: &Env,
+    org: &OrgCtx,
+    make_token: impl Fn(&str) -> String,
+) -> (axum::response::Response, String) {
+    let res = env
+        .router
         .clone()
         .oneshot(
             Request::builder()
-                .method("POST")
-                .uri("/login/oidc")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(body.to_string()))
+                .uri(format!(
+                    "/login/oidc/start?organization_id={}&workspace_id={}",
+                    org.org_id, org.workspace_id
+                ))
+                .body(axum::body::Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
+    assert_eq!(res.status(), StatusCode::FOUND, "oidc start redirects");
+    let location = res.headers()[header::LOCATION]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let param = |name: &str| {
+        location
+            .split(['?', '&'])
+            .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+            .unwrap_or_else(|| panic!("{name} in {location}"))
+            .to_string()
+    };
+    let (state, nonce, challenge) = (param("state"), param("nonce"), param("code_challenge"));
+    assert_eq!(param("code_challenge_method"), "S256");
+    let code = format!("code-{}", Uuid::now_v7().simple());
+    env.idp.authorize(&code, make_token(&nonce), &challenge);
+    let res = oidc_callback(env, &code, &state).await;
+    (res, state)
+}
+
+/// GET the callback with an explicit (code, state) pair.
+#[allow(dead_code)]
+pub async fn oidc_callback(env: &Env, code: &str, state: &str) -> axum::response::Response {
+    env.router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/login/oidc/callback?code={code}&state={state}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// OIDC login through the code flow. Returns the session cookie value.
+/// Shared login helper; not every suite exercises OIDC.
+#[allow(dead_code)]
+pub async fn oidc_login(env: &Env, org: &OrgCtx) -> String {
+    let subject = org.oidc_subject.clone();
+    let (res, _) = oidc_flow(env, org, |nonce| {
+        mint_id_token_for(&subject, "tinker-m1", 300, nonce)
+    })
+    .await;
     assert_eq!(res.status(), StatusCode::SEE_OTHER, "oidc login");
     extract_cookie(&res)
 }

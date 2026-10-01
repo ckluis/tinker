@@ -21,13 +21,18 @@
 //! * `OIDC_ISSUER`, `OIDC_AUDIENCE`, `OIDC_RSA_PEM` — when all three are
 //!   set, the OIDC adapter joins the broker. JWKS fetching is backlog;
 //!   supply the provider's RSA public key as PEM.
+//! * `OIDC_AUTHORIZATION_ENDPOINT`, `OIDC_TOKEN_ENDPOINT`,
+//!   `OIDC_CLIENT_ID`, `OIDC_REDIRECT_URI` (+ optional
+//!   `OIDC_CLIENT_SECRET`) — the relying-party client for the
+//!   authorization-code login (`/login/oidc/start` → provider →
+//!   `/login/oidc/callback`, PKCE S256 + nonce). All or none.
 
 use std::net::SocketAddr;
 
 use tinker_auth::{AuthBroker, OidcAdapter, OidcConfig, OidcKey, PasskeyAdapter};
 use tinker_db::{CoreDb, OwnerDb};
 use tinker_identity::{PgOidcBindingStore, PgPasskeyStore};
-use tinker_web::build_router;
+use tinker_web::build_router_with_oidc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -109,7 +114,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // M5: install the platform comms tables (owner-backed DDL, idempotent).
     state.comms.install().await?;
-    let app = build_router(state);
+    // OIDC code-flow client (partial config fails loud; none disables).
+    let oidc_client = tinker_web::oidc_flow::OidcClient::from_env()?;
+    if oidc_client.is_some() {
+        eprintln!("oidc code flow enabled");
+    }
+    let app = build_router_with_oidc(state, oidc_client);
 
     eprintln!("tinker listening on {addr}");
     let listener = tokio::net::TcpListener::bind(addr).await?;

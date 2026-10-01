@@ -69,6 +69,9 @@ struct IdTokenClaims {
     // validation happens inside `decode`.
     #[allow(dead_code)]
     exp: i64,
+    /// Echo of the nonce the login attempt sent to the provider.
+    #[serde(default)]
+    nonce: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -146,6 +149,20 @@ impl<S: OidcBindingStore> AuthAdapter for OidcAdapter<S> {
             .ok_or_else(|| TinkerError::Validation("oidc: missing id_token".into()))?;
 
         let claims = self.verify_token(id_token)?;
+        // Replay binding: the token must carry the nonce of THIS login
+        // attempt (minted server-side at /login/oidc/start and consumed
+        // once at the callback). A token lifted from another session —
+        // or a bare token presented without an attempt — has none that
+        // matches, so it never mints a session.
+        let expected_nonce = credential
+            .payload
+            .get("nonce")
+            .and_then(|v| v.as_str())
+            .filter(|n| !n.is_empty())
+            .ok_or_else(|| TinkerError::Validation("oidc: missing login nonce".into()))?;
+        if claims.nonce.as_deref() != Some(expected_nonce) {
+            return Err(TinkerError::Validation("oidc: nonce mismatch".into()));
+        }
 
         // The login request names its organization; scope the binding
         // lookup so a human with actors in several orgs resolves to the
@@ -239,7 +256,7 @@ mod tests {
     fn token(sub: &str, iss: &str, aud: &str, exp_offset_secs: i64) -> String {
         let exp = (Utc::now() + chrono::Duration::seconds(exp_offset_secs)).timestamp();
         let claims = serde_json::json!({
-            "iss": iss, "sub": sub, "aud": aud, "exp": exp, "iat": exp - 60,
+            "iss": iss, "sub": sub, "aud": aud, "exp": exp, "iat": exp - 60, "nonce": NONCE,
         });
         encode(
             &Header::new(Algorithm::RS256),
@@ -249,10 +266,34 @@ mod tests {
         .unwrap()
     }
 
+    /// The nonce of the (simulated) login attempt the tokens answer.
+    const NONCE: &str = "attempt-nonce-1";
+
     fn credential(id_token: &str) -> Credential {
         Credential {
             kind: CredentialKind::OidcCode,
-            payload: serde_json::json!({ "id_token": id_token }),
+            payload: serde_json::json!({ "id_token": id_token, "nonce": NONCE }),
+        }
+    }
+
+    #[tokio::test]
+    async fn token_without_the_attempt_nonce_is_rejected() {
+        let a = adapter(Uuid::now_v7(), Uuid::now_v7());
+        let t = token("user-123", "https://issuer.example", "tinker", 300);
+        // A bare token (no login attempt) and a token answering another
+        // attempt are both refused, even though signature/claims verify.
+        for payload in [
+            serde_json::json!({ "id_token": t }),
+            serde_json::json!({ "id_token": t, "nonce": "some-other-attempt" }),
+        ] {
+            let err = a
+                .authenticate(&Credential {
+                    kind: CredentialKind::OidcCode,
+                    payload,
+                })
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("nonce"), "{err}");
         }
     }
 

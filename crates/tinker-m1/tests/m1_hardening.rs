@@ -7,7 +7,7 @@ mod common;
 use axum::http::{header, Request, StatusCode};
 use tower::ServiceExt;
 
-use common::{body_text, get_with_cookie, mint_id_token, passkey_login, setup};
+use common::{body_text, get_with_cookie, passkey_login, setup};
 use tinker_auth::{AuthzDecision, AuthzScope};
 
 /// An expired session resolves to nothing — the request is bounced to
@@ -136,51 +136,105 @@ async fn passkey_challenge_replay_fails() {
     assert_eq!(second.status(), StatusCode::UNAUTHORIZED, "replay rejected");
 }
 
-/// An OIDC token for the wrong audience, or expired, never authenticates.
+/// An OIDC token for the wrong audience, expired, for an unknown
+/// subject, or answering a different login attempt never authenticates —
+/// even when it arrives through a real code-flow callback.
 #[tokio::test]
 async fn oidc_token_abuse_fails_closed() {
     let env = setup().await;
     let org = &env.org_a;
-
-    for (token, label) in [
+    let sub = org.oidc_subject.clone();
+    let cases: Vec<(&str, Box<dyn Fn(&str) -> String>)> = vec![
         (
-            mint_id_token(&org.oidc_subject, "wrong-audience", 300),
             "audience",
+            Box::new(|n: &str| common::mint_id_token_for(&sub, "wrong-audience", 300, n)),
         ),
         // Well past jsonwebtoken's 60s clock-skew leeway.
         (
-            mint_id_token(&org.oidc_subject, "tinker-m1", -3600),
             "expired",
+            Box::new(|n: &str| common::mint_id_token_for(&sub, "tinker-m1", -3600, n)),
         ),
         (
-            mint_id_token("unknown-subject", "tinker-m1", 300),
             "unknown subject",
+            Box::new(|n: &str| common::mint_id_token_for("unknown-subject", "tinker-m1", 300, n)),
         ),
-    ] {
-        let body = serde_json::json!({
-            "organization_id": org.org_id.to_string(),
-            "workspace_id": org.workspace_id.to_string(),
-            "id_token": token,
-        });
-        let res = env
-            .router
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/login/oidc")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(axum::body::Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+        // A valid token minted for some other login attempt (stolen /
+        // replayed from elsewhere): the nonce does not match this one.
+        (
+            "foreign nonce",
+            Box::new(|_: &str| {
+                common::mint_id_token_for(&sub, "tinker-m1", 300, "another-attempt")
+            }),
+        ),
+    ];
+    for (label, make) in cases {
+        let (res, _) = common::oidc_flow(&env, org, make).await;
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "{label}");
         assert!(
             res.headers().get(header::SET_COOKIE).is_none(),
             "{label}: no session"
         );
     }
+}
+
+/// The login attempt is single-use and the bare-token endpoint is gone:
+/// replaying a callback, inventing a state, or POSTing an ID token
+/// directly never mints a session.
+#[tokio::test]
+async fn oidc_callback_is_single_use_and_bare_tokens_are_refused() {
+    let env = setup().await;
+    let org = &env.org_a;
+    let sub = org.oidc_subject.clone();
+    let (res, state) = common::oidc_flow(&env, org, |n| {
+        common::mint_id_token_for(&sub, "tinker-m1", 300, n)
+    })
+    .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::SEE_OTHER,
+        "first callback logs in"
+    );
+
+    // Replay: same state, even with a freshly authorized code.
+    let challenge = "irrelevant";
+    env.idp.authorize(
+        "replay-code",
+        common::mint_id_token(&sub, "tinker-m1", 300),
+        challenge,
+    );
+    let res = common::oidc_callback(&env, "replay-code", &state).await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "replayed state");
+    let res = common::oidc_callback(&env, "replay-code", "made-up-state").await;
+    assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "unknown state");
+
+    // The old bare-token endpoint no longer exists.
+    let body = serde_json::json!({
+        "organization_id": org.org_id.to_string(),
+        "workspace_id": org.workspace_id.to_string(),
+        "id_token": common::mint_id_token(&sub, "tinker-m1", 300),
+    });
+    let res = env
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login/oidc")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(res.headers().get(header::SET_COOKIE).is_none());
+    assert!(
+        matches!(
+            res.status(),
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        ),
+        "{}",
+        res.status()
+    );
 }
 
 /// A session minted for org A cannot be used to act in org B: the

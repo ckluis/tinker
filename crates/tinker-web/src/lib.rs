@@ -55,6 +55,7 @@ pub mod live;
 /// Item 47: governed-metadata cache orchestration (query inputs +
 /// describe output). Same freshness contract as the query cache.
 pub mod meta;
+pub mod oidc_flow;
 pub mod schema;
 pub mod schema_page;
 
@@ -99,12 +100,20 @@ pub struct AppState {
 pub type SharedState = Arc<AppState>;
 
 pub fn build_router(state: SharedState) -> Router {
+    build_router_with_oidc(state, None)
+}
+
+/// [`build_router`] with an OIDC relying-party client: enables the
+/// authorization-code login at `/login/oidc/start` + `/login/oidc/callback`.
+/// Without one, both routes are 404 (OIDC login disabled).
+pub fn build_router_with_oidc(state: SharedState, oidc: Option<oidc_flow::OidcClient>) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/login", get(login_page))
         .route("/login/passkey/start", post(passkey_start))
         .route("/login/passkey/finish", post(passkey_finish))
-        .route("/login/oidc", post(oidc_login))
+        .route("/login/oidc/start", get(oidc_flow::start))
+        .route("/login/oidc/callback", get(oidc_flow::callback))
         .route("/logout", post(logout))
         .route("/apps", get(app_list))
         .route("/apps/{slug}", get(render_published_app))
@@ -222,6 +231,7 @@ pub fn build_router(state: SharedState) -> Router {
             "/api/schema/versions/{version_id}/rollback",
             post(schema::rollback),
         )
+        .layer(axum::Extension(oidc_flow::OidcFlow(oidc.map(Arc::new))))
         .with_state(state)
 }
 
@@ -372,24 +382,6 @@ async fn passkey_finish(
             "credential_id": body.credential_id,
             "challenge_id": body.challenge_id,
             "signature": body.signature,
-        }),
-    };
-    finish_login(&state, &credential, body.organization_id, body.workspace_id).await
-}
-
-#[derive(Debug, Deserialize)]
-struct OidcLogin {
-    organization_id: Uuid,
-    workspace_id: Uuid,
-    id_token: String,
-}
-
-async fn oidc_login(State(state): State<SharedState>, Json(body): Json<OidcLogin>) -> Response {
-    let credential = Credential {
-        kind: CredentialKind::OidcCode,
-        payload: serde_json::json!({
-            "id_token": body.id_token,
-            "organization_id": body.organization_id.to_string(),
         }),
     };
     finish_login(&state, &credential, body.organization_id, body.workspace_id).await

@@ -2912,6 +2912,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tinker-agents",
  "tinker-apps",

@@ -60,6 +60,7 @@ async fn authn_via_oidc(env: &common::Env) -> AuthnContext {
             kind: CredentialKind::OidcCode,
             payload: serde_json::json!({
                 "id_token": mint_id_token(&org.oidc_subject, "tinker-m1", 300),
+                "nonce": common::TEST_NONCE,
                 "organization_id": org.org_id.to_string(),
             }),
         })
@@ -229,6 +230,7 @@ async fn broker_adapter_set_is_swappable() {
         kind: CredentialKind::OidcCode,
         payload: serde_json::json!({
             "id_token": mint_id_token(&org.oidc_subject, "tinker-m1", 300),
+            "nonce": common::TEST_NONCE,
             "organization_id": org.org_id.to_string(),
         }),
     };
@@ -244,7 +246,7 @@ async fn http_sessions_from_both_methods_render_identically() {
     let env = setup().await;
 
     let cookie_p = passkey_login(&env.router, &env.org_a).await;
-    let cookie_o = oidc_login(&env.router, &env.org_a).await;
+    let cookie_o = oidc_login(&env, &env.org_a).await;
     assert_ne!(cookie_p, cookie_o, "distinct sessions");
 
     let html_p = body_text(get_with_cookie(&env.router, "/apps/dashboard", &cookie_p).await).await;
