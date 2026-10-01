@@ -693,3 +693,85 @@ async fn populated_field_can_be_made_sensitive() {
         .unwrap_err();
     assert!(err.to_string().contains("already sensitive"), "{err}");
 }
+
+/// `erase` (right to erasure) through the front door: explicit scope,
+/// owner/admin role, purpose audited, every sensitive value of the record
+/// destroyed while non-sensitive data stays.
+#[tokio::test]
+async fn erase_tool_destroys_sensitive_values_under_the_same_gate() {
+    let env = setup().await;
+    let ctx = new_org(&env).await;
+    let (_, slug) = contact_object(&env, &ctx).await;
+    let admin = issue_key(
+        &env,
+        ctx.organization_id.0,
+        "admin",
+        &["mcp:tools", "mcp:tool:reveal", "mcp:tool:erase"],
+    )
+    .await;
+    let d = door(&env, &admin, true).await;
+    let id = tool(
+        &d,
+        "create_record",
+        json!({"object": slug, "values": {"name": "Eve", "email": "eve@forget.me", "phone": "+15550100"}}),
+    )
+    .await
+    .unwrap()["record_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let erase = |door: FrontDoor| {
+        let (slug, id) = (slug.clone(), id.clone());
+        async move {
+            tool(
+                &door,
+                "erase",
+                json!({"object": slug, "record_id": id, "purpose": "DSR-2026-17"}),
+            )
+            .await
+        }
+    };
+
+    // Gate: blanket mcp:tools is not enough; a member is refused.
+    let no_scope = issue_key(&env, ctx.organization_id.0, "admin", &["mcp:tools"]).await;
+    assert_eq!(
+        erase(door(&env, &no_scope, true).await).await.unwrap_err()["code"],
+        -32001
+    );
+    let member = issue_key(
+        &env,
+        ctx.organization_id.0,
+        "member",
+        &["mcp:tools", "mcp:tool:erase"],
+    )
+    .await;
+    let err = erase(door(&env, &member, true).await).await.unwrap_err();
+    assert!(err.to_string().contains("owner or admin"), "{err}");
+
+    let out = erase(d).await.unwrap();
+    assert_eq!(out["values_destroyed"], 2);
+    let d = door(&env, &admin, true).await;
+    let rec = tool(&d, "get_record", json!({"object": slug, "record_id": id}))
+        .await
+        .unwrap();
+    assert_eq!(rec["record"]["email"], Value::Null);
+    assert_eq!(rec["record"]["phone"], Value::Null);
+    assert_eq!(rec["record"]["name"], "Eve");
+    assert_eq!(
+        reveal(&d, &slug, &id, "email").await.unwrap()["value"],
+        Value::Null
+    );
+    let mut tx = env.core.tenant_tx(&ctx).await.unwrap();
+    let meta: String = sqlx::query_scalar(
+        "SELECT metadata::text FROM audit_events WHERE action = 'pii.erase' AND resource_id = $1",
+    )
+    .bind(&id)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert!(
+        meta.contains("DSR-2026-17") && !meta.contains("forget.me"),
+        "{meta}"
+    );
+}

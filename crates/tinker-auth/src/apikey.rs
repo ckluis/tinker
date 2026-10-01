@@ -96,7 +96,7 @@ pub fn validate_scope(scope: &str) -> Result<()> {
 }
 
 /// Tools that `mcp:tools` does not cover: each needs `mcp:tool:<name>`.
-pub const EXPLICIT_ONLY_TOOLS: &[&str] = &["reveal"];
+pub const EXPLICIT_ONLY_TOOLS: &[&str] = &["reveal", "erase"];
 
 /// Does this scope set authorize an MCP method? `initialize`, `ping`,
 /// and notifications need auth only; everything else needs a scope.
@@ -108,8 +108,8 @@ pub fn scope_allows(scopes: &[String], method: &str, tool_name: Option<&str>) ->
             .any(|s| s == "mcp:tools" || s.starts_with("mcp:tool:")),
         "tools/call" => {
             let name = tool_name.unwrap_or_default();
-            // Plaintext PII disclosure is never implied by the blanket
-            // `mcp:tools`: `reveal` needs its own explicit grant.
+            // Plaintext PII disclosure and irreversible erasure are never
+            // implied by the blanket `mcp:tools`: each needs its own grant.
             if EXPLICIT_ONLY_TOOLS.contains(&name) {
                 return scopes.iter().any(|s| s == &format!("mcp:tool:{name}"));
             }

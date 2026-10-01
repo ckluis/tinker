@@ -390,6 +390,7 @@ impl FrontDoor {
             "transition" => self.tool_transition(&args).await,
             "render_dashboard" => self.tool_render_dashboard(&args).await,
             "reveal" => self.tool_reveal(&args).await,
+            "erase" => self.tool_erase(&args).await,
             _ => {
                 return rpc_error_value(
                     ERR_INVALID_PARAMS,
@@ -613,50 +614,32 @@ impl FrontDoor {
         }
     }
 
-    /// `reveal`: the only path that returns a sensitive field's plaintext
-    /// (docs/pii-sensitive-fields.md). Authorization runs in the same
-    /// order as every governed read — role, field projection, then the
-    /// record through the role's row policy — before the vault is
-    /// touched, and the vault projector audits the disclosure.
-    async fn tool_reveal(&self, args: &Value) -> Result<Value> {
-        check_unknown_keys(args, &["object", "record_id", "field", "purpose"], "reveal")?;
-        let slug = require_str(args, "object")?;
-        let field = require_str(args, "field")?;
-        let purpose = require_str(args, "purpose")?;
-        let record_id: Uuid = require_str(args, "record_id")?
-            .parse()
-            .map_err(|_| TinkerError::Validation("reveal: \"record_id\" must be a uuid".into()))?;
-        let purpose = purpose.trim();
-        if purpose.len() < 3 || purpose.len() > 500 {
-            return Err(TinkerError::Validation(
-                "reveal: \"purpose\" must be 3-500 chars; it is recorded in the audit trail".into(),
-            ));
-        }
+    /// Shared authorization for the PII tools (`reveal`, `erase`): role,
+    /// a configured vault, then the record through the caller's role
+    /// projection and row policy — invisible records are not_found, the
+    /// same as every governed read. Returns the sealer and governed inputs.
+    async fn pii_gate(
+        &self,
+        tool: &str,
+        slug: &str,
+        record_id: Uuid,
+    ) -> Result<(
+        &tinker_ontology::sensitive::PiiSealer,
+        Uuid,
+        tinker_live::QueryInputs,
+    )> {
         if !matches!(self.role.as_str(), "owner" | "admin") {
-            return Err(TinkerError::Forbidden(
-                "reveal needs the owner or admin role".into(),
-            ));
+            return Err(TinkerError::Forbidden(format!(
+                "{tool} needs the owner or admin role"
+            )));
         }
         let sealer = self.state.pii.as_ref().ok_or_else(|| {
-            TinkerError::Validation("reveal: this server has no PII vault configured".into())
+            TinkerError::Validation(format!("{tool}: this server has no PII vault configured"))
         })?;
-        let object_id = self.object_id(&slug).await?;
+        let object_id = self.object_id(slug).await?;
         let inputs =
             tinker_web::meta::query_inputs(&self.state, &self.tenant, &self.role, object_id, None)
                 .await?;
-        // Hidden and unknown fields look the same: not_found.
-        let f = inputs
-            .desc
-            .fields
-            .iter()
-            .find(|f| f.api_name == field && inputs.projection.allows(object_id, &field))
-            .ok_or_else(|| TinkerError::NotFound(format!("field {field}")))?;
-        if !f.sensitive {
-            return Err(TinkerError::Validation(format!(
-                "reveal: field '{field}' is not sensitive; read it with get_record"
-            )));
-        }
-        // The record must be visible to this role through its row policy.
         let intent = QueryIntent {
             from: object_id,
             select: vec!["__id".to_string()],
@@ -689,6 +672,84 @@ impl FrontDoor {
             .is_empty()
         {
             return Err(TinkerError::NotFound(format!("record {record_id}")));
+        }
+        Ok((sealer, object_id, inputs))
+    }
+
+    /// `erase`: destroy every sensitive value of one record (right to
+    /// erasure). Same gate as `reveal`; the erasure itself is audited as
+    /// `pii.erase` with the purpose and count, never values.
+    async fn tool_erase(&self, args: &Value) -> Result<Value> {
+        check_unknown_keys(args, &["object", "record_id", "purpose"], "erase")?;
+        let slug = require_str(args, "object")?;
+        let purpose = require_str(args, "purpose")?;
+        let record_id: Uuid = require_str(args, "record_id")?
+            .parse()
+            .map_err(|_| TinkerError::Validation("erase: \"record_id\" must be a uuid".into()))?;
+        let purpose = purpose.trim();
+        if purpose.len() < 3 || purpose.len() > 500 {
+            return Err(TinkerError::Validation(
+                "erase: \"purpose\" must be 3-500 chars; it is recorded in the audit trail".into(),
+            ));
+        }
+        let (sealer, object_id, inputs) = self.pii_gate("erase", &slug, record_id).await?;
+        let destroyed = sealer
+            .erase_record(&self.state.core, &self.tenant, &inputs.desc, record_id)
+            .await?;
+        let mut tx = self.state.core.tenant_tx(&self.tenant).await?;
+        sqlx::query(
+            "INSERT INTO audit_events \
+             (organization_id, actor_id, action, resource_type, resource_id, status, metadata) \
+             VALUES ($1, $2, 'pii.erase', $3, $4, 'ok', $5)",
+        )
+        .bind(self.tenant.organization_id.0)
+        .bind(self.tenant.actor_id)
+        .bind(&slug)
+        .bind(record_id.to_string())
+        .bind(serde_json::json!({ "purpose": purpose, "values_destroyed": destroyed }))
+        .execute(&mut *tx)
+        .await
+        .map_err(TinkerError::Db)?;
+        tx.commit().await.map_err(TinkerError::Db)?;
+        self.invalidate_query_cache(object_id).await;
+        Ok(serde_json::json!({
+            "object": slug,
+            "record_id": record_id,
+            "values_destroyed": destroyed,
+        }))
+    }
+
+    /// `reveal`: the only path that returns a sensitive field's plaintext
+    /// (docs/pii-sensitive-fields.md). Authorization runs in the same
+    /// order as every governed read — role, field projection, then the
+    /// record through the role's row policy — before the vault is
+    /// touched, and the vault projector audits the disclosure.
+    async fn tool_reveal(&self, args: &Value) -> Result<Value> {
+        check_unknown_keys(args, &["object", "record_id", "field", "purpose"], "reveal")?;
+        let slug = require_str(args, "object")?;
+        let field = require_str(args, "field")?;
+        let purpose = require_str(args, "purpose")?;
+        let record_id: Uuid = require_str(args, "record_id")?
+            .parse()
+            .map_err(|_| TinkerError::Validation("reveal: \"record_id\" must be a uuid".into()))?;
+        let purpose = purpose.trim();
+        if purpose.len() < 3 || purpose.len() > 500 {
+            return Err(TinkerError::Validation(
+                "reveal: \"purpose\" must be 3-500 chars; it is recorded in the audit trail".into(),
+            ));
+        }
+        let (sealer, object_id, inputs) = self.pii_gate("reveal", &slug, record_id).await?;
+        // Hidden and unknown fields look the same: not_found.
+        let f = inputs
+            .desc
+            .fields
+            .iter()
+            .find(|f| f.api_name == field && inputs.projection.allows(object_id, &field))
+            .ok_or_else(|| TinkerError::NotFound(format!("field {field}")))?;
+        if !f.sensitive {
+            return Err(TinkerError::Validation(format!(
+                "reveal: field '{field}' is not sensitive; read it with get_record"
+            )));
         }
         let mut tx = self.state.core.tenant_tx(&self.tenant).await?;
         let ref_id: Option<Uuid> = sqlx::query_scalar(&format!(
@@ -1095,6 +1156,7 @@ fn tool_names() -> Vec<&'static str> {
         "transition",
         "render_dashboard",
         "reveal",
+        "erase",
     ]
 }
 
@@ -1181,6 +1243,15 @@ fn tools_list_result() -> Value {
                     "field": { "type": "string", "description": "api_name of a sensitive field" },
                     "purpose": { "type": "string", "description": "Why this value is needed (3-500 chars); stored in the audit trail" }
                 }), &["object", "record_id", "field", "purpose"]),
+            ),
+            tool(
+                "erase",
+                "Irreversibly destroy every sensitive value of ONE record (right to erasure): vault ciphertext for the live row, its version history and drafts, refs tombstoned, sensitive columns cleared. Non-sensitive fields are untouched. Requires the owner or admin role and a key with the explicit mcp:tool:erase scope; audited with its purpose. Invisible records are not_found.",
+                obj(serde_json::json!({
+                    "object": { "type": "string", "description": "Object api_slug" },
+                    "record_id": { "type": "string", "description": "Record UUID" },
+                    "purpose": { "type": "string", "description": "Why (3-500 chars), e.g. the erasure request id; stored in the audit trail" }
+                }), &["object", "record_id", "purpose"]),
             ),
             tool(
                 "render_dashboard",

@@ -18,11 +18,11 @@ Status: ACCEPTED 2026-09-30. Decisions D1–D3 were made by the operator; the re
 | D8 | Fail closed | Writing a sensitive field without a configured vault and index key is a typed error. A sensitive filter without an index key is rejected. A caller can never supply a sealed form: caller values are always treated as plaintext and sealed |
 
 ## Structural guards
-- **The column type is the guard.** Any writer that skips sealing (ingest `write_canonical_tx`, `durable::cas_update`, comms `insert_row`) binds text into a `UUID` column and Postgres rejects it. Any reader that skips masking (agents `render_record`, comms unfurl, schema preview) sees only an opaque ref id, which is useless without `reveal`.
+- **The column type is the guard.** Any writer that skips sealing (`durable::cas_update`, comms `insert_row`; ingest now seals through `IngestPipeline::with_pii`) binds text into a `UUID` column and Postgres rejects it. Any reader that skips masking (agents `render_record`, comms unfurl, schema preview) sees only an opaque ref id, which is useless without `reveal`.
 - **Search and embeddings**: records in `data.*` are not indexed today (only comms messages are), and comms messages go through the existing storage-class guard. If a future record indexer is added, it must skip `sensitive` fields.
 
 ## Erasure
-`erase_sensitive(ctx, object, record_id)` destroys every vault value for the record (refs referenced by the row, drafts and versions), tombstones the `pii_refs` rows, and nulls the row's sensitive columns. History rows keep their ref ids, which then resolve to "pii value unavailable".
+`PiiSealer::erase_record(core, ctx, object, record_id)`, exposed as the MCP `erase` tool (owner/admin, explicit `mcp:tool:erase` scope, purpose audited as `pii.erase`), destroys every vault value for the record (refs referenced by the row, drafts and versions, and refs superseded by updates), tombstones the `pii_refs` rows, and nulls the row's sensitive columns. History rows keep their ref ids, which then resolve to "pii value unavailable".
 
 ## Retrofit: making a populated field sensitive
 `tinker-cli field make-sensitive --object <slug> --field <api_name>` (or `PiiSealer::make_field_sensitive` followed by `IngestPipeline::retrofit_sensitive`):
