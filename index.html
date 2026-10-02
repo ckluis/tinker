@@ -1,0 +1,911 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tinker — build on data you can't see</title>
+<meta name="description" content="Tinker is an ontology-driven internal-tool platform in Rust and PostgreSQL 18. Personal data is sealed by type: every read gets a mask, automations get a key, and a person sees the value only after a second person approves.">
+<meta name="color-scheme" content="dark">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&family=Instrument+Serif:ital@0;1&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#06070a; --ink-2:#0b0d12; --ink-3:#11141b; --line:rgba(255,255,255,.08); --line-2:rgba(255,255,255,.14);
+  --text:#eceef3; --dim:#9aa1b2; --faint:#5d6476;
+  --brass:#f0b75e; --brass-2:#ffd79a; --mint:#5ef2c6; --mint-2:#b6ffe9; --violet:#8b7bff; --rose:#ff6b8a;
+  --serif:"Instrument Serif",Georgia,serif; --sans:"Geist",system-ui,-apple-system,Segoe UI,sans-serif; --mono:"Geist Mono",ui-monospace,SFMono-Regular,Menlo,monospace;
+  --r:22px; --gutter:clamp(16px,4vw,48px); --max:1200px;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--ink);color:var(--text);font:400 17px/1.6 var(--sans);overflow-x:hidden;-webkit-font-smoothing:antialiased}
+a{color:inherit}
+code,.mono{font-family:var(--mono)}
+img,svg{max-width:100%}
+.wrap{max-width:var(--max);margin:0 auto;padding:0 var(--gutter)}
+.eyebrow{font:500 12px/1 var(--mono);letter-spacing:.18em;text-transform:uppercase;color:var(--dim);display:inline-flex;gap:10px;align-items:center}
+.eyebrow::before{content:"";width:22px;height:1px;background:currentColor;opacity:.6}
+.serif{font-family:var(--serif);font-style:italic;font-weight:400;letter-spacing:-.01em}
+.grad-brass{background:linear-gradient(100deg,var(--brass-2),var(--brass) 45%,#ff9f6b);-webkit-background-clip:text;background-clip:text;color:transparent}
+.grad-mint{background:linear-gradient(100deg,var(--mint-2),var(--mint) 50%,#47c2ff);-webkit-background-clip:text;background-clip:text;color:transparent}
+
+/* ---------- nav ---------- */
+.nav{position:sticky;top:0;z-index:50;backdrop-filter:saturate(1.4) blur(16px);-webkit-backdrop-filter:saturate(1.4) blur(16px);background:rgba(6,7,10,.62);border-bottom:1px solid var(--line)}
+.nav .wrap{display:flex;align-items:center;gap:24px;height:58px}
+.logo{display:flex;align-items:center;gap:10px;font-weight:600;letter-spacing:-.01em;text-decoration:none}
+.logo svg{width:22px;height:22px}
+.nav-links{display:flex;gap:22px;margin-left:auto;font-size:14px;color:var(--dim)}
+.nav-links a{text-decoration:none;transition:color .2s}
+.nav-links a:hover{color:var(--text)}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 18px;border-radius:999px;font:500 14px/1 var(--sans);text-decoration:none;border:1px solid var(--line-2);background:rgba(255,255,255,.04);transition:transform .2s,background .2s,border-color .2s;white-space:nowrap}
+.btn:hover{transform:translateY(-1px);background:rgba(255,255,255,.08);border-color:rgba(255,255,255,.24)}
+.btn.primary{background:var(--text);color:var(--ink);border-color:var(--text)}
+.btn.primary:hover{background:#fff}
+.nav .btn{padding:8px 14px;font-size:13px}
+@media (max-width:860px){.nav-links{display:none}.nav .btn{margin-left:auto}}
+
+/* ---------- atmosphere ---------- */
+.atmo{position:absolute;inset:0;overflow:hidden;pointer-events:none;z-index:0}
+.blob{position:absolute;border-radius:50%;filter:blur(90px);opacity:.55;mix-blend-mode:screen;animation:drift 22s ease-in-out infinite alternate}
+.b1{width:620px;height:620px;left:-140px;top:-120px;background:radial-gradient(circle,#ffb35c 0,#ff7a59 35%,transparent 70%);opacity:.32}
+.b2{width:720px;height:720px;right:-220px;top:40px;background:radial-gradient(circle,#5ef2c6 0,#2aa7ff 40%,transparent 70%);opacity:.28;animation-duration:28s;animation-delay:-6s}
+.b3{width:560px;height:560px;left:35%;top:420px;background:radial-gradient(circle,#8b7bff 0,#5b3dff 40%,transparent 70%);opacity:.3;animation-duration:25s;animation-delay:-12s}
+@keyframes drift{0%{transform:translate3d(0,0,0) scale(1)}50%{transform:translate3d(60px,40px,0) scale(1.12)}100%{transform:translate3d(-40px,80px,0) scale(.95)}}
+.gridbg{position:absolute;inset:0;background-image:linear-gradient(var(--line) 1px,transparent 1px),linear-gradient(90deg,var(--line) 1px,transparent 1px);background-size:64px 64px;mask-image:radial-gradient(ellipse 70% 60% at 50% 30%,#000 30%,transparent 75%);-webkit-mask-image:radial-gradient(ellipse 70% 60% at 50% 30%,#000 30%,transparent 75%);opacity:.5}
+.grain{position:fixed;inset:0;pointer-events:none;z-index:100;opacity:.05;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3' stitchTiles='stitch'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>")}
+
+/* ---------- hero ---------- */
+.hero{position:relative;padding:clamp(64px,10vw,130px) 0 80px;isolation:isolate}
+.hero .wrap{position:relative;z-index:1;display:grid;grid-template-columns:1fr 1fr;gap:40px 56px;align-items:center}
+.hero-top{grid-column:1/-1}
+.hero h1{font:600 clamp(46px,9.6vw,136px)/.92 var(--sans);letter-spacing:-.05em;margin:22px 0 0}
+.hero h1 .serif{font-size:1.08em;letter-spacing:-.02em;display:inline-block;padding-right:.08em}
+.lede{font-size:clamp(17px,1.6vw,20px);color:var(--dim);max-width:560px;margin:0 0 34px}
+.lede b{color:var(--text);font-weight:500}
+.cta{display:flex;gap:12px;flex-wrap:wrap}
+.pills{display:flex;flex-wrap:wrap;gap:8px;margin-top:34px}
+.pill{font:500 12px/1 var(--mono);padding:8px 11px;border-radius:999px;border:1px solid var(--line-2);color:var(--dim);background:rgba(255,255,255,.025)}
+.pill i{font-style:normal;color:var(--mint)}
+@media (max-width:960px){.hero .wrap{grid-template-columns:1fr}}
+
+/* record object */
+.object{position:relative;perspective:1400px}
+.object::before{content:"";position:absolute;inset:8% 4% -6%;background:radial-gradient(ellipse at 50% 40%,rgba(240,183,94,.35),rgba(94,242,198,.18) 45%,transparent 70%);filter:blur(40px);z-index:-1;animation:pulse 9s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:.7}50%{opacity:1}}
+.record{border-radius:26px;padding:22px;background:linear-gradient(160deg,rgba(255,255,255,.09),rgba(255,255,255,.02) 40%),var(--ink-2);border:1px solid var(--line-2);box-shadow:0 40px 120px -20px rgba(0,0,0,.8),inset 0 1px 0 rgba(255,255,255,.12);transform:rotateX(8deg) rotateY(-12deg) rotateZ(1deg);transform-style:preserve-3d;animation:float 12s ease-in-out infinite}
+@keyframes float{0%,100%{transform:rotateX(8deg) rotateY(-12deg) rotateZ(1deg) translateY(0)}50%{transform:rotateX(5deg) rotateY(-7deg) rotateZ(0) translateY(-10px)}}
+@media (max-width:960px){.record,.record{transform:none;animation:none}}
+.rec-head{display:flex;align-items:center;gap:10px;padding-bottom:16px;border-bottom:1px solid var(--line);font:500 12px/1 var(--mono);color:var(--dim)}
+.dots{display:flex;gap:6px}.dots i{width:10px;height:10px;border-radius:50%;background:#2a2e38}
+.rec-head .obj{margin-left:6px;color:var(--text)}
+.rec-head .rid{margin-left:auto;color:var(--faint)}
+.phase{position:relative;height:42px;margin:16px 0 8px}
+.phase span{position:absolute;inset:0;display:flex;align-items:center;gap:10px;font:500 12px/1.3 var(--mono);letter-spacing:.06em;text-transform:uppercase;opacity:0}
+.phase b{padding:6px 10px;border-radius:8px;font-weight:600;letter-spacing:.12em}
+.ph-v b{background:rgba(255,107,138,.15);color:var(--rose);border:1px solid rgba(255,107,138,.35)}
+.ph-m b{background:rgba(240,183,94,.14);color:var(--brass);border:1px solid rgba(240,183,94,.35)}
+.ph-k b{background:rgba(94,242,198,.12);color:var(--mint);border:1px solid rgba(94,242,198,.35)}
+.phase span em{font-style:normal;color:var(--dim);text-transform:none;letter-spacing:0;font-size:12.5px}
+.field{display:grid;grid-template-columns:96px 1fr;gap:14px;align-items:center;padding:13px 0;border-bottom:1px dashed var(--line)}
+.field:last-child{border-bottom:0}
+.fname{font:500 12px/1 var(--mono);color:var(--faint);display:flex;flex-direction:column;gap:6px}
+.fname small{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--brass);opacity:.8}
+.fval{font:500 16px/1.2 var(--mono);position:relative;height:22px;white-space:nowrap}
+.fval.plain{color:var(--text)}
+.face{position:absolute;left:0;top:0;opacity:0;white-space:nowrap}
+.face.v{color:var(--rose)}
+.face.m{color:var(--brass);letter-spacing:.2em}
+.face.k{color:var(--mint)}
+.cycle .ph-v,.cycle .face.v{animation:faceA 12s infinite}
+.cycle .ph-m,.cycle .face.m{animation:faceB 12s infinite}
+.cycle .ph-k,.cycle .face.k{animation:faceC 12s infinite}
+@keyframes faceA{0%,2%{opacity:0;transform:translateY(6px);filter:blur(4px)}6%,28%{opacity:1;transform:none;filter:none}32%,100%{opacity:0;transform:translateY(-6px);filter:blur(4px)}}
+@keyframes faceB{0%,33%{opacity:0;transform:translateY(6px);filter:blur(4px)}37%,61%{opacity:1;transform:none;filter:none}65%,100%{opacity:0;transform:translateY(-6px);filter:blur(4px)}}
+@keyframes faceC{0%,66%{opacity:0;transform:translateY(6px);filter:blur(4px)}70%,94%{opacity:1;transform:none;filter:none}98%,100%{opacity:0;transform:translateY(-6px);filter:blur(4px)}}
+.rec-foot{margin-top:16px;display:flex;gap:8px;flex-wrap:wrap}
+.rec-foot span{font:500 11px/1 var(--mono);padding:7px 9px;border-radius:7px;background:rgba(255,255,255,.04);border:1px solid var(--line);color:var(--dim)}
+.scanline{position:absolute;left:22px;right:22px;height:60px;top:0;background:linear-gradient(180deg,transparent,rgba(94,242,198,.12),transparent);animation:scan 4s linear infinite;pointer-events:none;border-radius:8px}
+@keyframes scan{from{top:80px}to{top:calc(100% - 60px)}}
+
+/* ---------- stats ---------- */
+.stats{border-top:1px solid var(--line);border-bottom:1px solid var(--line);background:linear-gradient(180deg,rgba(255,255,255,.02),transparent)}
+.stats .wrap{display:grid;grid-template-columns:repeat(6,1fr)}
+.stat{padding:30px 18px;border-left:1px solid var(--line)}
+.stat:first-child{border-left:0}
+.stat .n{font:600 clamp(30px,3.6vw,46px)/1 var(--sans);letter-spacing:-.04em}
+.stat .l{font:500 11px/1.4 var(--mono);text-transform:uppercase;letter-spacing:.12em;color:var(--dim);margin-top:10px}
+@media (max-width:900px){.stats .wrap{grid-template-columns:repeat(3,1fr)}.stat:nth-child(4){border-left:0}.stat{border-top:1px solid var(--line)}.stat:nth-child(-n+3){border-top:0}}
+@media (max-width:520px){.stats .wrap{grid-template-columns:repeat(2,1fr)}.stat{border-left:1px solid var(--line)!important;border-top:1px solid var(--line)!important}.stat:nth-child(odd){border-left:0!important}.stat:nth-child(-n+2){border-top:0!important}}
+
+/* ---------- sections ---------- */
+section.sec{position:relative;padding:clamp(90px,12vw,160px) 0}
+.sec-hero{max-width:900px;margin-bottom:64px}
+.sec-hero h2{font:600 clamp(38px,6vw,76px)/1 var(--sans);letter-spacing:-.04em;margin:20px 0 22px}
+.sec-hero p{font-size:clamp(17px,1.5vw,20px);color:var(--dim);margin:0;max-width:720px}
+.num{font:500 12px/1 var(--mono);color:var(--faint);letter-spacing:.14em}
+.card{position:relative;border-radius:var(--r);background:linear-gradient(170deg,rgba(255,255,255,.055),rgba(255,255,255,.012) 50%),var(--ink-2);border:1px solid var(--line);overflow:hidden}
+.card.pad{padding:28px}
+.card h3{font:600 21px/1.25 var(--sans);letter-spacing:-.02em;margin:0 0 10px}
+.card p{color:var(--dim);margin:0;font-size:15.5px}
+.glowline{position:absolute;inset:0;border-radius:inherit;pointer-events:none;padding:1px;background:linear-gradient(140deg,rgba(255,255,255,.25),transparent 30%,transparent 70%,rgba(94,242,198,.3));-webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);-webkit-mask-composite:xor;mask-composite:exclude}
+
+/* faces explorer (CSS-only tabs) */
+.faces{display:grid;grid-template-columns:280px minmax(0,1fr);gap:20px}
+@media (max-width:900px){.faces{grid-template-columns:1fr}}
+.faces input{position:absolute;opacity:0;pointer-events:none}
+.tabs{display:flex;flex-direction:column;gap:12px}
+@media (max-width:900px){.tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}.tabs label{padding:14px}.tabs .s{display:none}.tabs .t{font-size:16px}}
+.tabs label{cursor:pointer;border-radius:18px;padding:20px;border:1px solid var(--line);background:rgba(255,255,255,.02);transition:all .25s}
+.tabs label:hover{border-color:var(--line-2)}
+.tabs .t{font:600 18px/1 var(--sans);display:flex;align-items:center;gap:10px}
+.tabs .t i{width:10px;height:10px;border-radius:3px}
+.tabs .s{font-size:13.5px;color:var(--dim);margin-top:8px;line-height:1.45}
+.panes{position:relative;min-height:440px}
+.pane{display:none}
+#f-mask:checked~.tabs label[for=f-mask]{border-color:rgba(240,183,94,.5);background:rgba(240,183,94,.07)}
+#f-key:checked~.tabs label[for=f-key]{border-color:rgba(94,242,198,.5);background:rgba(94,242,198,.06)}
+#f-val:checked~.tabs label[for=f-val]{border-color:rgba(255,107,138,.5);background:rgba(255,107,138,.06)}
+#f-mask:checked~.panes .p-mask,#f-key:checked~.panes .p-key,#f-val:checked~.panes .p-val{display:block;animation:paneIn .45s ease}
+@keyframes paneIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+.pane .card{height:100%}
+.pane-grid{display:grid;grid-template-columns:minmax(0,.9fr) minmax(0,1.1fr);gap:0}
+@media (max-width:700px){.pane-grid{grid-template-columns:1fr}}
+.pane-copy{padding:32px}
+.pane-copy h3{font-size:28px;letter-spacing:-.03em}
+.pane-copy ul{list-style:none;padding:0;margin:22px 0 0;display:grid;gap:12px}
+.pane-copy li{font-size:15px;color:var(--dim);padding-left:22px;position:relative}
+.pane-copy li::before{content:"";position:absolute;left:0;top:9px;width:10px;height:1px;background:currentColor}
+.pane-copy li b{color:var(--text);font-weight:500}
+.code{margin:0;padding:28px;font:400 13.5px/1.75 var(--mono);color:#c9cfdd;background:rgba(0,0,0,.35);border-left:1px solid var(--line);overflow-x:auto;white-space:pre}
+@media (max-width:700px){.code{border-left:0;border-top:1px solid var(--line);font-size:12.5px;padding:22px}}
+.c-c{color:var(--faint)}.c-k{color:#9fb3ff}.c-s{color:#ffd79a}.c-m{color:var(--mint)}.c-b{color:var(--brass)}.c-r{color:var(--rose)}
+
+/* flow */
+.flow{display:grid;grid-template-columns:repeat(4,1fr) 1.15fr;gap:0;align-items:stretch}
+.node{position:relative;padding:26px 22px;border:1px solid var(--line);background:var(--ink-2);border-radius:20px;margin-right:34px}
+.node:last-child{margin-right:0}
+.node::after{content:"";position:absolute;right:-35px;top:50%;width:35px;height:2px;background:linear-gradient(90deg,var(--line-2) 50%,transparent 0) 0 0/10px 2px;}
+.node:last-child::after{display:none}
+.node .packet{position:absolute;right:-35px;top:calc(50% - 3px);width:8px;height:8px;border-radius:50%;background:var(--mint);box-shadow:0 0 14px var(--mint);animation:pkt 2.4s linear infinite}
+.node:nth-child(2) .packet{animation-delay:.6s}.node:nth-child(3) .packet{animation-delay:1.2s}.node:nth-child(4) .packet{animation-delay:1.8s}
+@keyframes pkt{0%{transform:translateX(0);opacity:0}15%{opacity:1}85%{opacity:1}100%{transform:translateX(30px);opacity:0}}
+.node .k{font:500 11px/1 var(--mono);color:var(--faint);letter-spacing:.14em}
+.node h4{font:600 18px/1.2 var(--sans);margin:14px 0 8px;letter-spacing:-.015em}
+.node p{font-size:14px;color:var(--dim);margin:0;line-height:1.5}
+.node code{font-size:12px;color:var(--mint);word-break:break-word}
+.stores{display:grid;grid-template-rows:1fr auto 1fr;gap:0;padding:0;border:0;background:none}
+.store{border:1px solid var(--line);border-radius:18px;padding:18px 20px;background:var(--ink-2)}
+.store.v{border-color:rgba(240,183,94,.35);background:linear-gradient(160deg,rgba(240,183,94,.09),transparent 60%),var(--ink-2)}
+.store h4{margin:6px 0 6px;font-size:16px}
+.wall{display:flex;align-items:center;gap:10px;padding:10px 4px;font:500 11px/1 var(--mono);color:var(--rose);letter-spacing:.08em;text-transform:uppercase}
+.wall::before,.wall::after{content:"";flex:1;height:2px;background:repeating-linear-gradient(90deg,var(--rose) 0 6px,transparent 6px 12px);opacity:.6}
+@media (max-width:1000px){
+  .flow{grid-template-columns:1fr}
+  .node{margin:0 0 34px}
+  .node::after{right:auto;left:40px;top:auto;bottom:-35px;width:2px;height:35px;background:linear-gradient(180deg,var(--line-2) 50%,transparent 0) 0 0/2px 10px}
+  .node .packet{right:auto;left:37px;top:auto;bottom:-35px;animation-name:pktv}
+}
+@keyframes pktv{0%{transform:translateY(0);opacity:0}15%{opacity:1}85%{opacity:1}100%{transform:translateY(30px);opacity:0}}
+.facts{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;margin-top:28px}
+@media (max-width:900px){.facts{grid-template-columns:1fr}}
+
+/* automations */
+.auto{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+@media (max-width:900px){.auto{grid-template-columns:1fr}}
+.panel-h{display:flex;align-items:center;justify-content:space-between;padding:16px 22px;border-bottom:1px solid var(--line);font:500 12px/1 var(--mono);color:var(--dim)}
+.panel-h b{color:var(--text);font-weight:500}
+.tag{font:600 10px/1 var(--mono);letter-spacing:.12em;padding:6px 8px;border-radius:6px;text-transform:uppercase}
+.tag.r{color:var(--rose);background:rgba(255,107,138,.12)}
+.tag.g{color:var(--mint);background:rgba(94,242,198,.12)}
+.tag.b{color:var(--brass);background:rgba(240,183,94,.12)}
+.auto .code{border-left:0;background:transparent;min-height:300px}
+.hash{position:relative;display:inline-block}
+.transmute .lit{animation:litOut 7s infinite}
+.transmute .dig{position:absolute;left:0;top:0;opacity:0;animation:digIn 7s infinite}
+@keyframes litOut{0%,30%{opacity:1;filter:none}40%,100%{opacity:0;filter:blur(6px)}}
+@keyframes digIn{0%,34%{opacity:0;filter:blur(6px)}46%,94%{opacity:1;filter:none}100%{opacity:0}}
+.runlog{grid-column:1/-1}
+.runlog table{width:100%;border-collapse:collapse;font:400 13px/1.4 var(--mono)}
+.runlog th{text-align:left;font-weight:500;color:var(--faint);font-size:11px;letter-spacing:.1em;text-transform:uppercase;padding:14px 22px;border-bottom:1px solid var(--line)}
+.runlog td{padding:14px 22px;border-bottom:1px solid var(--line);color:#c9cfdd;white-space:nowrap}
+.runlog tr:last-child td{border-bottom:0}
+.runlog .scroll{overflow-x:auto}
+.ok,.runlog td.ok{color:var(--mint)}.no,.runlog td.no{color:var(--rose)}.sk,.runlog td.sk{color:var(--faint)}
+.guards{display:grid;grid-template-columns:repeat(4,1fr);gap:20px;margin-top:20px}
+@media (max-width:1000px){.guards{grid-template-columns:repeat(2,1fr)}}
+@media (max-width:560px){.guards{grid-template-columns:1fr}}
+.guard .big{font:600 44px/1 var(--sans);letter-spacing:-.04em;margin-bottom:12px}
+
+/* four eyes */
+.eyes{display:grid;grid-template-columns:repeat(3,1fr);gap:20px;position:relative}
+@media (max-width:900px){.eyes{grid-template-columns:1fr}}
+.step{padding:28px}
+.who{display:flex;align-items:center;gap:12px;margin-bottom:22px}
+.avatar{width:42px;height:42px;border-radius:12px;display:grid;place-items:center;font:600 14px/1 var(--mono)}
+.avatar.a{background:rgba(139,123,255,.18);color:#b9afff;border:1px solid rgba(139,123,255,.4)}
+.avatar.b{background:rgba(240,183,94,.15);color:var(--brass);border:1px solid rgba(240,183,94,.4)}
+.who small{display:block;font:500 11px/1.3 var(--mono);color:var(--faint);letter-spacing:.06em}
+.call{margin-top:18px;font:400 12.5px/1.6 var(--mono);color:#c9cfdd;background:rgba(0,0,0,.35);border:1px solid var(--line);border-radius:12px;padding:14px;overflow-x:auto;white-space:pre}
+.stepn{position:absolute;top:22px;right:24px;font:600 64px/1 var(--sans);letter-spacing:-.05em;color:rgba(255,255,255,.05)}
+.refuse{margin-top:20px;display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+@media (max-width:900px){.refuse{grid-template-columns:1fr}}
+.refuse .card{padding:20px 22px;display:flex;gap:14px;align-items:flex-start}
+.refuse .x{flex:none;width:26px;height:26px;border-radius:8px;display:grid;place-items:center;background:rgba(255,107,138,.12);color:var(--rose);font:600 14px/1 var(--mono)}
+.refuse p{font-size:14.5px}
+
+/* shred */
+.shred{display:grid;grid-template-columns:1.1fr .9fr;gap:20px}
+@media (max-width:900px){.shred{grid-template-columns:1fr}}
+.keys{padding:28px}
+.keygrid{display:grid;grid-template-columns:repeat(8,1fr);gap:10px;margin:22px 0}
+.kc{aspect-ratio:1;border-radius:10px;border:1px solid rgba(240,183,94,.28);background:radial-gradient(circle at 50% 35%,rgba(240,183,94,.25),rgba(240,183,94,.03) 70%);position:relative;display:grid;place-items:center}
+.kc svg{width:46%;height:46%;opacity:.8}
+.kc.target{border-color:var(--rose);animation:targetGlow 8s infinite}
+.kc.target svg{animation:shatter 8s infinite}
+.kc.target::after{content:"";position:absolute;inset:-1px;border-radius:10px;border:1px dashed var(--rose);opacity:0;animation:ghost 8s infinite}
+@keyframes targetGlow{0%,30%{box-shadow:0 0 0 rgba(255,107,138,0)}38%{box-shadow:0 0 30px rgba(255,107,138,.7)}50%,100%{box-shadow:none;background:transparent;border-color:transparent}}
+@keyframes shatter{0%,36%{transform:none;opacity:.8;filter:none}46%{transform:scale(1.4) rotate(14deg);opacity:0;filter:blur(6px)}100%{opacity:0}}
+@keyframes ghost{0%,46%{opacity:0}52%,96%{opacity:.6}100%{opacity:0}}
+.backup{padding:28px;display:flex;flex-direction:column}
+.cipher{flex:1;margin-top:18px;border-radius:14px;background:rgba(0,0,0,.4);border:1px solid var(--line);padding:18px;font:400 12px/1.7 var(--mono);color:#7d8599;word-break:break-all;position:relative;overflow:hidden}
+.cipher .row{display:block}
+.cipher .mine{color:var(--brass);animation:dead 8s infinite}
+@keyframes dead{0%,40%{color:var(--brass);filter:none;text-decoration:none}50%,96%{color:#3d4250;filter:blur(1.2px);text-decoration:line-through}100%{color:var(--brass)}}
+.verdict{margin-top:14px;font:500 12px/1.4 var(--mono);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;color:var(--dim)}
+.verdict b{color:var(--rose);font-weight:500}
+.caveat{margin-top:20px;padding:20px 24px;border-radius:16px;border:1px solid rgba(240,183,94,.3);background:rgba(240,183,94,.05);color:var(--dim);font-size:15px}
+.caveat b{color:var(--brass);font-weight:500}
+
+/* tools */
+.tools{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}
+@media (max-width:900px){.tools{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:560px){.tools{grid-template-columns:1fr}}
+.tool{padding:20px;border-radius:16px;border:1px solid var(--line);background:var(--ink-2);transition:transform .25s,border-color .25s}
+.tool:hover{transform:translateY(-3px);border-color:var(--line-2)}
+.tool .tn{font:500 15px/1.2 var(--mono);display:flex;align-items:center;gap:8px;color:var(--text);min-width:0;overflow-wrap:anywhere}
+.tool p{font-size:13.5px;color:var(--dim);margin:10px 0 0;line-height:1.45}
+.tool.x{border-color:rgba(240,183,94,.35);background:linear-gradient(160deg,rgba(240,183,94,.08),transparent 60%),var(--ink-2)}
+.tool.x .tn{color:var(--brass-2)}
+.tool .lock{margin-left:auto;font:600 9.5px/1 var(--mono);letter-spacing:.1em;color:var(--brass);border:1px solid rgba(240,183,94,.4);border-radius:5px;padding:4px 5px}
+.legend{display:flex;gap:22px;flex-wrap:wrap;margin-top:18px;font:500 12px/1.4 var(--mono);color:var(--dim)}
+.legend span{display:flex;align-items:center;gap:8px}
+.legend i{width:12px;height:12px;border-radius:4px;border:1px solid var(--line-2)}
+.thesis{margin-top:20px;display:grid;grid-template-columns:1fr 1fr;gap:20px}
+@media (max-width:900px){.thesis{grid-template-columns:1fr}}
+.card .quote{font:400 clamp(26px,2.8vw,36px)/1.2 var(--serif);font-style:italic;color:var(--text);margin:0}
+
+/* crates */
+.layers{display:grid;gap:14px}
+.layer{display:grid;grid-template-columns:220px 1fr;gap:20px;align-items:start;padding:22px 24px}
+@media (max-width:800px){.layer{grid-template-columns:1fr}}
+.layer h4{margin:0;font:600 17px/1.3 var(--sans)}
+.layer h4 small{display:block;font:400 13px/1.45 var(--sans);color:var(--dim);margin-top:6px}
+.crates{display:flex;flex-wrap:wrap;gap:8px}
+.crate{font:500 12.5px/1 var(--mono);padding:9px 11px;border-radius:9px;border:1px solid var(--line);background:rgba(255,255,255,.025);color:#c9cfdd;position:relative}
+.crate span{color:var(--faint);font-family:var(--sans);font-size:12px;margin-left:6px}
+.crate.new{border-color:rgba(94,242,198,.45);color:var(--mint-2)}
+.crate.new::after{content:"new";position:absolute;top:-8px;right:-6px;font:600 9px/1 var(--mono);text-transform:uppercase;letter-spacing:.08em;background:var(--mint);color:var(--ink);padding:3px 5px;border-radius:4px}
+.ms{display:grid;grid-template-columns:repeat(9,1fr);gap:6px}
+@media (max-width:800px){.ms{grid-template-columns:repeat(3,1fr)}}
+.mi{border-radius:10px;border:1px solid var(--line);padding:12px 10px;background:rgba(255,255,255,.02)}
+.mi b{display:block;font:600 14px/1 var(--mono);color:var(--brass)}
+.mi span{display:block;font-size:12px;color:var(--dim);margin-top:6px;line-height:1.35}
+
+/* evidence */
+.evid{display:grid;grid-template-columns:1.25fr .75fr;gap:20px}
+@media (max-width:960px){.evid{grid-template-columns:1fr}}
+.proofs{list-style:none;margin:0;padding:0}
+.proofs li{display:grid;grid-template-columns:22px 1fr;gap:14px;padding:16px 24px;border-bottom:1px solid var(--line)}
+.proofs li:last-child{border-bottom:0}
+.proofs .tick{width:22px;height:22px;border-radius:7px;background:rgba(94,242,198,.13);color:var(--mint);display:grid;place-items:center;font:600 12px/1 var(--mono);margin-top:2px}
+.proofs code{font-size:12.5px;color:var(--mint-2);word-break:break-all}
+.proofs p{margin:4px 0 0;font-size:14px;color:var(--dim)}
+.side{display:grid;gap:20px;align-content:start}
+.meter{padding:24px}
+.meter .big{font:600 52px/1 var(--sans);letter-spacing:-.04em}
+.bar{height:8px;border-radius:99px;background:rgba(255,255,255,.06);margin:16px 0 10px;overflow:hidden}
+.bar i{display:block;height:100%;width:99.85%;background:linear-gradient(90deg,var(--mint),#47c2ff);border-radius:inherit;transform-origin:left;animation:grow 2.4s cubic-bezier(.2,.8,.2,1) both}
+@keyframes grow{from{transform:scaleX(0)}}
+.limits{padding:24px}
+.limits ul{margin:12px 0 0;padding:0;list-style:none;display:grid;gap:10px}
+.limits li{font-size:14px;color:var(--dim);padding-left:18px;position:relative}
+.limits li::before{content:"–";position:absolute;left:0;color:var(--brass)}
+
+/* quickstart */
+.term{border-radius:20px;overflow:hidden;border:1px solid var(--line-2);background:#05060a;box-shadow:0 30px 100px -30px rgba(94,242,198,.25)}
+.term-h{display:flex;align-items:center;gap:8px;padding:14px 18px;border-bottom:1px solid var(--line);font:500 12px/1 var(--mono);color:var(--faint)}
+.term-h .dots{margin-right:10px}
+.term pre{margin:0;padding:26px 24px;font:400 14px/1.9 var(--mono);color:#c9cfdd;overflow-x:auto}
+.term .p{color:var(--mint)}
+.start-grid{display:grid;grid-template-columns:1.3fr .7fr;gap:20px;align-items:start}
+@media (max-width:900px){.start-grid{grid-template-columns:1fr}}
+.reqs{padding:26px}
+.reqs dl{margin:14px 0 0;display:grid;grid-template-columns:auto 1fr;gap:10px 18px;font-size:14px}
+.reqs dt{font:500 12px/1.7 var(--mono);color:var(--faint)}
+.reqs dd{margin:0;color:var(--dim)}
+
+/* closing */
+.closing{text-align:center;padding:clamp(110px,14vw,190px) 0;position:relative;isolation:isolate;overflow:hidden}
+.closing h2{font:600 clamp(44px,8vw,110px)/.95 var(--sans);letter-spacing:-.05em;margin:0 0 26px}
+.closing p{color:var(--dim);font-size:19px;max-width:620px;margin:0 auto 36px}
+.closing .cta{justify-content:center}
+footer{border-top:1px solid var(--line);padding:30px 0 40px;font:400 13px/1.6 var(--sans);color:var(--faint)}
+footer .wrap{display:flex;gap:20px;flex-wrap:wrap;justify-content:space-between}
+footer a{color:var(--dim);text-decoration:none}
+
+/* reveal (JS only enhances; content is visible without it) */
+.js .rv{opacity:0;transform:translateY(28px);transition:opacity .9s cubic-bezier(.2,.7,.2,1),transform .9s cubic-bezier(.2,.7,.2,1)}
+.js .rv.in{opacity:1;transform:none}
+.js .rv.d1{transition-delay:.08s}.js .rv.d2{transition-delay:.16s}.js .rv.d3{transition-delay:.24s}
+
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+  .js .rv{opacity:1;transform:none}
+  .cycle .face.m,.cycle .ph-m{opacity:1}
+  .transmute .lit{opacity:0}.transmute .dig{opacity:1}
+  .kc.target svg{opacity:.8}
+  .scanline,.packet{display:none}
+}
+</style>
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+
+<nav class="nav">
+  <div class="wrap">
+    <a class="logo" href="#top" aria-label="Tinker home">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect x="2.5" y="2.5" width="19" height="19" rx="6" stroke="url(#lg)" stroke-width="1.6"/><path d="M8 8.5h8M12 8.5v8" stroke="#eceef3" stroke-width="1.8" stroke-linecap="round"/><circle cx="16.5" cy="16" r="1.6" fill="#5ef2c6"/><defs><linearGradient id="lg" x1="0" y1="0" x2="24" y2="24"><stop stop-color="#ffd79a"/><stop offset="1" stop-color="#5ef2c6"/></linearGradient></defs></svg>
+      Tinker
+    </a>
+    <div class="nav-links">
+      <a href="#faces">Sealed fields</a>
+      <a href="#governor">Data path</a>
+      <a href="#automations">Automations</a>
+      <a href="#shred">Erasure</a>
+      <a href="#agents">Agents</a>
+      <a href="#evidence">Evidence</a>
+    </div>
+    <a class="btn" data-repo href="#start">Get the source →</a>
+  </div>
+</nav>
+
+<!-- ================= HERO ================= -->
+<header class="hero" id="top">
+  <div class="atmo" aria-hidden="true"><div class="gridbg"></div><div class="blob b1"></div><div class="blob b2"></div><div class="blob b3"></div></div>
+  <div class="wrap">
+    <div class="hero-top">
+      <span class="eyebrow rv">Open source · Rust · PostgreSQL 18</span>
+      <h1 class="rv d1">Build on data<br>you <span class="serif grad-brass">can't see.</span></h1>
+    </div>
+    <div>
+      <p class="lede rv d2">Tinker is an ontology-driven builder for internal tools. Define an object once and it becomes <b>a real Postgres table behind row-level security</b>, a governed API, and an MCP front door for agents. Personal data is sealed by type. <b>Every read gets a mask</b> and <b>automations get a key</b>. A person sees the value <b>only when a second person approves</b>.</p>
+      <div class="cta rv d3">
+        <a class="btn primary" href="#start">Run it locally</a>
+        <a class="btn" href="#faces">See a sealed field →</a>
+      </div>
+      <div class="pills rv d3">
+        <span class="pill"><i>●</i> Rust workspace</span>
+        <span class="pill">PostgreSQL 18 + RLS</span>
+        <span class="pill">AES-256-GCM vault</span>
+        <span class="pill">HMAC blind index</span>
+        <span class="pill">MCP · stdio + HTTP/SSE</span>
+        <span class="pill">Passkeys · OIDC + PKCE</span>
+        <span class="pill">MIT</span>
+      </div>
+    </div>
+
+    <div class="object rv d2" aria-label="A customer record whose email and phone cycle between value, mask and key">
+      <div class="record cycle" style="position:relative">
+        <div class="scanline" aria-hidden="true"></div>
+        <div class="rec-head"><span class="dots"><i></i><i></i><i></i></span><span class="obj">customer</span><span class="rid">rec_01J9…7f2c</span></div>
+        <div class="phase" aria-hidden="true">
+          <span class="ph-v"><b>Value</b><em>vault only, after a second person approves</em></span>
+          <span class="ph-m"><b>Mask</b><em>what every read and every agent gets</em></span>
+          <span class="ph-k"><b>Key</b><em>what automations compare and log</em></span>
+        </div>
+        <div class="field"><div class="fname">name</div><div class="fval plain">Ada Lovelace</div></div>
+        <div class="field"><div class="fname">email<small>pii · sealed</small></div><div class="fval"><span class="face v">ada@analytical.engine</span><span class="face m">••••••</span><span class="face k">pk_3f9a0c71e2…b84d</span></div></div>
+        <div class="field"><div class="fname">phone<small>pii · sealed</small></div><div class="fval"><span class="face v">+44 20 7946 0018</span><span class="face m">••••••</span><span class="face k">pk_c41e96d07a…19f0</span></div></div>
+        <div class="field"><div class="fname">plan</div><div class="fval plain">Enterprise</div></div>
+        <div class="field"><div class="fname">status</div><div class="fval plain">published · v3</div></div>
+        <div class="rec-foot"><span>org scoped · RLS</span><span>core stores a vault ref</span><span>email__bidx</span></div>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div class="stats">
+  <div class="wrap">
+    <div class="stat rv"><div class="n">29</div><div class="l">Rust crates</div></div>
+    <div class="stat rv d1"><div class="n">91k</div><div class="l">lines of Rust</div></div>
+    <div class="stat rv d2"><div class="n grad-mint">662</div><div class="l">tests passing · 0 failing</div></div>
+    <div class="stat rv"><div class="n">59</div><div class="l">SQL migrations</div></div>
+    <div class="stat rv d1"><div class="n">12</div><div class="l">MCP tools</div></div>
+    <div class="stat rv d2"><div class="n grad-brass">0</div><div class="l">plaintext in sealed columns</div></div>
+  </div>
+</div>
+
+<!-- ================= FACES ================= -->
+<section class="sec" id="faces">
+  <div class="wrap">
+    <div class="sec-hero">
+      <span class="num rv">01 — SEALED FIELDS</span>
+      <h2 class="rv d1">One field.<br><span class="serif">Three faces.</span></h2>
+      <p class="rv d2">Email and phone fields are personal data by type, so they are always sealed. Text fields opt in. The core database never holds the value. It holds a vault reference and a keyed blind index, and each audience gets exactly the face it needs.</p>
+    </div>
+
+    <div class="faces rv">
+      <input type="radio" name="face" id="f-mask" checked>
+      <input type="radio" name="face" id="f-key">
+      <input type="radio" name="face" id="f-val">
+      <div class="tabs" role="tablist">
+        <label for="f-mask"><div class="t"><i style="background:var(--brass)"></i>Mask</div><div class="s">Every read: queries, dashboards, caches, search, agents.</div></label>
+        <label for="f-key"><div class="t"><i style="background:var(--mint)"></i>Key</div><div class="s">Automations, webhooks, run logs and <code>field:key</code> selects.</div></label>
+        <label for="f-val"><div class="t"><i style="background:var(--rose)"></i>Value</div><div class="s">One person, one field, one time, with an audited purpose and a second approver.</div></label>
+      </div>
+      <div class="panes">
+        <div class="pane p-mask"><div class="card"><div class="glowline"></div><div class="pane-grid">
+          <div class="pane-copy">
+            <span class="tag b">default</span>
+            <h3 style="margin-top:16px">Masked in the compiler, not the UI.</h3>
+            <p>The typed query compiler writes the mask into the SQL itself, so every consumer that builds on it inherits the mask and none of them can forget it.</p>
+            <ul>
+              <li><b>Exact match still works.</b> <code>eq</code>, <code>ne</code> and <code>in</code> go through the HMAC-SHA256 blind index.</li>
+              <li><b>Anything that would leak is refused.</b> That covers <code>contains</code>, ranges, sorting and row policies on sealed fields.</li>
+              <li><b>Copied sealed forms are rejected.</b> You can't paste one record's vault reference into another.</li>
+            </ul>
+          </div>
+<pre class="code"><span class="c-c">// MCP · query</span>
+{ <span class="c-k">"object"</span>: <span class="c-s">"customer"</span>,
+  <span class="c-k">"intent"</span>: {
+    <span class="c-k">"select"</span>: [<span class="c-s">"name"</span>, <span class="c-s">"email"</span>,
+               <span class="c-s">"phone"</span>, <span class="c-s">"plan"</span>],
+    <span class="c-k">"filters"</span>: [{
+      <span class="c-k">"field"</span>: <span class="c-s">"email"</span>, <span class="c-k">"op"</span>: <span class="c-s">"eq"</span>,
+      <span class="c-k">"value"</span>: <span class="c-s">"Ada@Analytical.Engine "</span> }] } }
+
+<span class="c-c">// → rows, matched via email__bidx</span>
+[{ <span class="c-k">"name"</span>:  <span class="c-s">"Ada Lovelace"</span>,
+   <span class="c-k">"email"</span>: <span class="c-b">"••••••"</span>,
+   <span class="c-k">"phone"</span>: <span class="c-b">"••••••"</span>,
+   <span class="c-k">"plan"</span>:  <span class="c-s">"Enterprise"</span> }]
+
+<span class="c-c">// "order": [{ "field": "email" }]</span>
+<span class="c-r">error: field 'email' is sensitive and</span>
+<span class="c-r">       cannot be sorted on</span></pre>
+        </div></div></div>
+
+        <div class="pane p-key"><div class="card"><div class="glowline"></div><div class="pane-grid">
+          <div class="pane-copy">
+            <span class="tag g">automation key</span>
+            <h3 style="margin-top:16px">Stable for a value. Useless to anyone else.</h3>
+            <p><code>pk_</code> followed by 40 hex characters of HMAC over the blind index, in a separate domain. The same email always gives the same key, so you can join, dedupe and route on it. The key won't query the index and can't be reversed.</p>
+            <ul>
+              <li><b>Scoped per field</b>, like the index. Keys are never comparable across objects, which keeps cross-object linkage closed.</li>
+              <li><b>Shows up wherever a value would leak</b>: run logs, webhook payloads, exports.</li>
+            </ul>
+          </div>
+<pre class="code"><span class="c-c">// MCP · query, selecting keys</span>
+{ <span class="c-k">"object"</span>: <span class="c-s">"customer"</span>,
+  <span class="c-k">"intent"</span>: { <span class="c-k">"select"</span>: [<span class="c-s">"name"</span>, <span class="c-m">"email:key"</span>] } }
+
+<span class="c-c">// → rows</span>
+[{ <span class="c-k">"name"</span>: <span class="c-s">"Ada Lovelace"</span>,
+   <span class="c-k">"email:key"</span>: <span class="c-m">"pk_3f9a0c71e2…b84d"</span> },
+ { <span class="c-k">"name"</span>: <span class="c-s">"A. Lovelace"</span>,
+   <span class="c-k">"email:key"</span>: <span class="c-m">"pk_3f9a0c71e2…b84d"</span> }]
+<span class="c-c">// same person, found without seeing the address</span></pre>
+        </div></div></div>
+
+        <div class="pane p-val"><div class="card"><div class="glowline"></div><div class="pane-grid">
+          <div class="pane-copy">
+            <span class="tag r">four eyes</span>
+            <h3 style="margin-top:16px">Plaintext is an event, not a read.</h3>
+            <p>The <code>reveal</code> tool returns one field of one record. It needs an owner or admin with an explicit scope, a stated purpose, and an approval decided by someone else. That approval works only once.</p>
+            <ul>
+              <li><b>The vault is a separate database</b> with its own roles. Core SQL can't join to it, and a test proves that.</li>
+              <li><b>Each record has its own key</b> (AES-256-GCM, wrapped by a rotating KEK), so erasing the record destroys the key.</li>
+            </ul>
+          </div>
+<pre class="code"><span class="c-c">// MCP · reveal</span>
+{ <span class="c-k">"object"</span>: <span class="c-s">"customer"</span>,
+  <span class="c-k">"record_id"</span>: <span class="c-s">"01J9…7f2c"</span>,
+  <span class="c-k">"field"</span>: <span class="c-s">"email"</span>,
+  <span class="c-k">"approval_request_id"</span>: <span class="c-s">"01J9…a40e"</span> }
+
+<span class="c-c">// → value (audited as pii.reveal)</span>
+<span class="c-r">"ada@analytical.engine"</span>
+
+<span class="c-c">// same approval, second time</span>
+<span class="c-r">error: reveal needs an approved pii.reveal</span>
+<span class="c-r">  request for this field, filed by you and</span>
+<span class="c-r">  approved by someone else</span></pre>
+        </div></div></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= GOVERNOR ================= -->
+<section class="sec" id="governor" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-hero">
+      <span class="num rv">02 — THE DATA PATH</span>
+      <h2 class="rv d1">Every path goes<br>through <span class="serif grad-mint">the governor.</span></h2>
+      <p class="rv d2">The builder, the HTTP API, the CLI, live grids, search, dashboards and agents all go through one compiler. Tenancy is enforced in Postgres, not in application code you have to trust.</p>
+    </div>
+    <div class="flow">
+      <div class="node rv"><span class="packet"></span><div class="k">01 · CREDENTIAL</div><h4>Who is asking</h4><p>Machine keys (<code>tk_…</code>), passkeys (WebAuthn ES256/EdDSA, UV for MFA) or OIDC code flow with PKCE, state and nonce. Each resolves to one actor, one org and one role.</p></div>
+      <div class="node rv d1"><span class="packet"></span><div class="k">02 · TENANT TX</div><h4>Which org, by the database</h4><p><code>SET LOCAL app.organization_id</code> inside a transaction on a role that can't bypass RLS. The tenant comes from the credential, never from the caller.</p></div>
+      <div class="node rv d2"><span class="packet"></span><div class="k">03 · COMPILER</div><h4>What they may see</h4><p>Role projection, row policies, masking and the blind index are compiled into one SQL statement. Unauthorized rows come back <code>not_found</code>, so there's no existence oracle.</p></div>
+      <div class="node rv d3"><span class="packet"></span><div class="k">04 · GOVERNED WRITE</div><h4>How it changes</h4><p>Validation, lifecycles (draft → review → publish), approvals bound to the action, and an automation event written in the <em>same</em> transaction.</p></div>
+      <div class="node stores rv d3">
+        <div class="store"><div class="k" style="font:500 11px/1 var(--mono);color:var(--faint);letter-spacing:.14em">CORE · PG18</div><h4>Real tables</h4><p style="font-size:13.5px;color:var(--dim);margin:0">One table per object. Sealed columns hold a vault ref plus <code style="color:var(--mint)">__bidx</code>.</p></div>
+        <div class="wall">no join</div>
+        <div class="store v"><div class="k" style="font:500 11px/1 var(--mono);color:var(--brass);letter-spacing:.14em">VAULT · PG18</div><h4>Ciphertext</h4><p style="font-size:13.5px;color:var(--dim);margin:0">Per-subject DEKs wrapped by the KEK, with every access audited.</p></div>
+      </div>
+    </div>
+    <div class="facts">
+      <div class="card pad rv"><h3>Ontology → real tables</h3><p>Objects, fields, relations and lifecycles are metadata that materializes into real Postgres DDL, not an entity-attribute-value store. Schema changes ship as versioned evolutions with canary and promote.</p></div>
+      <div class="card pad rv d1"><h3>Fail closed, loudly</h3><p>A missing extension, an unset vault, a dead IdP or a half-configured key gives a typed error at startup or call time. Nothing silently falls back to plaintext.</p></div>
+      <div class="card pad rv d2"><h3>Durable by default</h3><p>DBOS-style workflows, queues and timers on Postgres itself. Outboxes for email and automations mean no event is lost and none is invented.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= AUTOMATIONS ================= -->
+<section class="sec" id="automations" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-hero">
+      <span class="num rv">03 — AUTOMATIONS</span>
+      <h2 class="rv d1">Automate on email addresses<br><span class="serif grad-mint">no one can read.</span></h2>
+      <p class="rv d2">Conditions compare keys and actions resolve values only at the moment they run. Typed literals are turned into keys when the automation is saved. The saved definition never contains the plaintext you typed into it.</p>
+    </div>
+    <div class="auto">
+      <div class="card rv">
+        <div class="panel-h"><b>What the author types</b><span class="tag r">plaintext · once</span></div>
+<pre class="code"><span class="c-c">// MCP · automation</span>
+{ <span class="c-k">"action"</span>: <span class="c-s">"save"</span>,
+  <span class="c-k">"object"</span>: <span class="c-s">"customer"</span>,
+  <span class="c-k">"name"</span>: <span class="c-s">"VIP escalation"</span>,
+  <span class="c-k">"trigger"</span>: { <span class="c-k">"on"</span>: <span class="c-s">"record_updated"</span>,
+               <span class="c-k">"fields"</span>: [<span class="c-s">"email"</span>] },
+  <span class="c-k">"conditions"</span>: [{ <span class="c-k">"field"</span>: <span class="c-s">"email"</span>, <span class="c-k">"op"</span>: <span class="c-s">"eq"</span>,
+    <span class="c-k">"value"</span>: <span class="c-r">"ceo@northwind.example"</span> }],
+  <span class="c-k">"actions"</span>: [
+    { <span class="c-k">"type"</span>: <span class="c-s">"send_email"</span>, <span class="c-k">"to_field"</span>: <span class="c-s">"email"</span>,
+      <span class="c-k">"subject"</span>: <span class="c-s">"Your account team"</span>,
+      <span class="c-k">"body"</span>: <span class="c-s">"Hi {{ name }}, …"</span> },
+    { <span class="c-k">"type"</span>: <span class="c-s">"webhook"</span>,
+      <span class="c-k">"url"</span>: <span class="c-s">"https://hooks.example/vip"</span>,
+      <span class="c-k">"fields"</span>: [<span class="c-s">"name"</span>, <span class="c-s">"email"</span>] }
+  ] }</pre>
+      </div>
+      <div class="card rv d1">
+        <div class="panel-h"><b>What gets stored</b><span class="tag g">keys only</span></div>
+<pre class="code"><span class="c-c">-- automations.conditions (jsonb)</span>
+[{ <span class="c-k">"field"</span>: <span class="c-s">"email"</span>,
+   <span class="c-k">"op"</span>: <span class="c-s">"eq"</span>,
+   <span class="c-k">"keyed"</span>: <span class="c-m">true</span>,
+   <span class="c-k">"value"</span>: <span class="hash transmute"><span class="lit c-r">"ceo@northwind.example"</span><span class="dig c-m">"pk_8d07e5b2a9…41c2"</span></span>
+}]
+
+<span class="c-c">-- run_as_role: admin (re-checked every run)</span>
+<span class="c-c">-- send_email.to_field → a vault ref in the outbox,</span>
+<span class="c-c">--   resolved in-process at send, audited,</span>
+<span class="c-c">--   never written back</span>
+<span class="c-c">-- webhook body → ids, "fields": {"name": …},</span>
+<span class="c-c">--   </span><span class="c-m">"keys": {"email": "pk_3f9a…b84d"}</span>
+<span class="c-c">--   Idempotency-Key: automation:event:action</span></pre>
+      </div>
+      <div class="card runlog rv">
+        <div class="panel-h"><b>automation_runs</b><span>outcomes and keys, never values</span></div>
+        <div class="scroll"><table>
+          <thead><tr><th>event</th><th>record</th><th>email:key</th><th>outcome</th><th>detail</th></tr></thead>
+          <tbody>
+            <tr><td>updated</td><td>01J9…7f2c</td><td class="ok">pk_3f9a…b84d</td><td class="ok">succeeded</td><td>email queued · webhook 200</td></tr>
+            <tr><td>updated</td><td>01J9…c0d1</td><td class="sk">pk_77e0…2a19</td><td class="sk">skipped</td><td>condition false</td></tr>
+            <tr><td>updated</td><td>01J9…7f2c</td><td class="ok">pk_3f9a…b84d</td><td class="no">loop_blocked</td><td>depth 3</td></tr>
+          </tbody>
+        </table></div>
+      </div>
+    </div>
+    <div class="guards">
+      <div class="card pad guard rv"><div class="big grad-mint">tx</div><h3>Outbox in the same transaction</h3><p>An event exists exactly when the write commits. Workers claim with <code>SKIP LOCKED</code>, and each (automation, event) pair runs once.</p></div>
+      <div class="card pad guard rv d1"><div class="big grad-brass">3</div><h3>Loop depth</h3><p>Writes made by an action carry the chain depth forward. At depth 3 the run records <code>loop_blocked</code> and stops.</p></div>
+      <div class="card pad guard rv d2"><div class="big" style="color:var(--rose)">20/h</div><h3>Guessing guard</h3><p>An equality literal is a yes-or-no question about a value, so each actor can save at most 20 sealed literals per hour. Saves are audited with counts only.</p></div>
+      <div class="card pad guard rv d3"><div class="big">=</div><h3>Never sees more than its author</h3><p>Runs as the author's role, under that role's projection and row policy. If the author loses the role, the next run fails closed.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= FOUR EYES ================= -->
+<section class="sec" id="reveal" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-hero">
+      <span class="num rv">04 — REVEAL</span>
+      <h2 class="rv d1">Two people.<br><span class="serif grad-brass">One field. One time.</span></h2>
+      <p class="rv d2">This uses the same four-eyes approvals that guard publishing, bound to the exact (object, record, field). The approval is consumed atomically with the reveal.</p>
+    </div>
+    <div class="eyes">
+      <div class="card step rv"><span class="stepn">1</span>
+        <div class="who"><div class="avatar a">SB</div><div><b>support-bot</b><small>agent · tk_ key · admin</small></div></div>
+        <h3>Asks, with a reason</h3><p>It files a <code>pii.reveal</code> request for one field. The purpose is stored and audited.</p>
+<div class="call">request_reveal {
+  field: "email",
+  purpose: "support ticket 42"
+}</div></div>
+      <div class="card step rv d1"><span class="stepn">2</span>
+        <div class="who"><div class="avatar b">MR</div><div><b>Maya R.</b><small>human · passkey · admin</small></div></div>
+        <h3>Someone else decides</h3><p>A different owner or admin lists the pending requests and approves or denies them. The requester can never decide their own request.</p>
+<div class="call">approvals { action: "list" }
+approvals { action: "approve",
+            id: "01J9…a40e" }</div></div>
+      <div class="card step rv d2"><span class="stepn">3</span>
+        <div class="who"><div class="avatar a">SB</div><div><b>support-bot</b><small>same requester</small></div></div>
+        <h3>Reveals, once</h3><p>It must come from the same requester, for the same field, before the approval expires. The vault decrypts in-process and logs the access.</p>
+<div class="call">reveal { field: "email",
+  approval_request_id: "01J9…a40e" }
+→ "ada@analytical.engine"</div></div>
+    </div>
+    <div class="refuse">
+      <div class="card rv"><span class="x">✕</span><p><b style="color:var(--text);font-weight:500">Self-approval.</b> The requester is recorded on the request and refused at decision time, whether they approve or deny.</p></div>
+      <div class="card rv d1"><span class="x">✕</span><p><b style="color:var(--text);font-weight:500">Replay.</b> A second reveal with the same approval fails. So does a reveal of a different field or record.</p></div>
+      <div class="card rv d2"><span class="x">✕</span><p><b style="color:var(--text);font-weight:500">Blanket scopes.</b> <code>mcp:tools</code> doesn't cover <code>reveal</code>. The key needs <code>mcp:tool:reveal</code> by name.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= SHRED ================= -->
+<section class="sec" id="shred" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-hero">
+      <span class="num rv">05 — ERASURE</span>
+      <h2 class="rv d1">Forget someone<br><span class="serif">by destroying a key.</span></h2>
+      <p class="rv d2">Every record has its own data-encryption key. Erasure tombstones the refs, nulls the columns and destroys the key, so any copy of that ciphertext, in a dump or a replica, becomes noise.</p>
+    </div>
+    <div class="shred">
+      <div class="card keys rv">
+        <span class="tag b">wrapped_deks · one per subject</span>
+        <div class="keygrid" aria-hidden="true">
+          <!-- 24 keys, one targeted -->
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc target"><svg viewBox="0 0 24 24" fill="none" stroke="#ff6b8a" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+          <div class="kc"><svg viewBox="0 0 24 24" fill="none" stroke="#f0b75e" stroke-width="1.8"><circle cx="8" cy="12" r="4"/><path d="M12 12h9M18 12v3M21 12v2"/></svg></div>
+        </div>
+        <h3>Erase <code style="color:var(--rose)">rec_…7f2c</code></h3>
+        <p>The MCP <code>erase</code> tool, gated like <code>reveal</code> and audited as <code>pii.erase</code>, destroys every value for the record (row, drafts, versions, superseded copies). It then shreds the subject's DEKs. One record's erasure never touches anyone else's key.</p>
+      </div>
+      <div class="card backup rv d1">
+        <span class="tag r">a backup taken yesterday</span>
+        <div class="cipher" aria-hidden="true">
+          <span class="row">e7 1c 9a 04 5f d2 88 3b 0e a1 c4 77 19 6d f0 2a</span>
+          <span class="row mine">b4 39 c2 7e 01 dd 5a 93 66 0f 8b e2 4c a7 15 38 ◂ 7f2c</span>
+          <span class="row">2f 80 de 13 9b 47 c6 0a 71 e5 3d 58 aa 06 92 cf</span>
+          <span class="row mine">5c f1 08 b7 64 2e 9d a3 1b 70 c8 45 e9 0d 36 7a ◂ 7f2c</span>
+          <span class="row">93 0b 6e d4 27 a8 51 fc 3e 89 12 c7 64 b0 5d e3</span>
+          <span class="row">40 aa 17 cb 72 0f 9e 35 d8 61 b4 2c e0 57 8a 1d</span>
+        </div>
+        <div class="verdict"><span>restore → decrypt</span><b>wrapped_dek_id: no such key</b></div>
+      </div>
+    </div>
+    <div class="caveat rv"><b>Honest limits.</b> A backup that also contains <code>wrapped_deks</code> still holds the key until it ages out, so back up the key table on a shorter retention than the values. Values sealed before per-subject keys sit under a legacy org key; erasure destroys them row by row but can't shred that shared key.</div>
+  </div>
+</section>
+
+<!-- ================= AGENTS ================= -->
+<section class="sec" id="agents" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-hero">
+      <span class="num rv">06 — AGENT FRONT DOOR</span>
+      <h2 class="rv d1">An API no model has seen,<br><span class="serif grad-mint">that teaches itself.</span></h2>
+      <p class="rv d2">Tinker isn't in any model's training data, so the MCP server is designed to be self-describing. An agent with nothing but a <code>tk_</code> key discovers the schema, learns the governed write paths and does correct work. Agents only ever see the mask.</p>
+    </div>
+    <div class="tools">
+      <div class="tool rv"><div class="tn">describe</div><p>Objects, fields, lifecycles and allowed operations for this role.</p></div>
+      <div class="tool rv d1"><div class="tn">query</div><p>Typed, governed reads with filters, keys and blind-index matches.</p></div>
+      <div class="tool rv d2"><div class="tn">get_record</div><p>One record, projected and masked for the caller.</p></div>
+      <div class="tool rv d3"><div class="tn">create_record</div><p>Validated, sealed at entry, with an outbox event.</p></div>
+      <div class="tool rv"><div class="tn">update_record</div><p>Governed update; changed fields feed triggers.</p></div>
+      <div class="tool rv d1"><div class="tn">transition</div><p>Lifecycle moves: draft, review, publish.</p></div>
+      <div class="tool rv d2"><div class="tn">render_dashboard</div><p>Dashboards through the same compiler and mask.</p></div>
+      <div class="tool x rv d3"><div class="tn">automation<span class="lock">EXPLICIT</span></div><p>Save, list, enable, disable and inspect runs.</p></div>
+      <div class="tool x rv"><div class="tn">request_reveal<span class="lock">EXPLICIT</span></div><p>File a purpose-bound <code>pii.reveal</code> request.</p></div>
+      <div class="tool x rv d1"><div class="tn">approvals<span class="lock">EXPLICIT</span></div><p>List, approve or deny, never your own request.</p></div>
+      <div class="tool x rv d2"><div class="tn">reveal<span class="lock">EXPLICIT</span></div><p>One field, once, with a second person's approval.</p></div>
+      <div class="tool x rv d3"><div class="tn">erase<span class="lock">EXPLICIT</span></div><p>Destroy a record's PII and shred its keys.</p></div>
+    </div>
+    <div class="legend rv"><span><i style="background:var(--ink-2)"></i>covered by <code>mcp:tools</code></span><span><i style="background:rgba(240,183,94,.25);border-color:rgba(240,183,94,.5)"></i>needs <code>mcp:tool:&lt;name&gt;</code> by name, and owner or admin</span><span>stdio and HTTP/SSE · <code>tinker://ontology/{slug}</code> resources</span></div>
+    <div class="thesis">
+      <div class="card pad rv"><p class="quote">“If the front door doesn't win clearly, it failed.”</p><p style="margin-top:14px">That was the bar Tinker set itself: median time to the first correct publish for a fresh agent, measured against raw HTTP plus human docs. Across three timed, independently verified experiments, adding skill docs on top of the MCP never beat the MCP alone; every verdict was a loss or a tie. The MCP documents itself.</p></div>
+      <div class="card pad rv d1"><h3>Machine keys that mean something</h3><p>A <code>tk_</code> key is bound to one organization and one role at issue time. Sessions take their tenant from the credential, never from the request. Unknown arguments are rejected with a teaching error, not ignored, so an agent learns the real shape instead of guessing.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= ARCHITECTURE ================= -->
+<section class="sec" id="architecture" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-hero">
+      <span class="num rv">07 — ARCHITECTURE</span>
+      <h2 class="rv d1">29 crates.<br><span class="serif">Built in gated milestones.</span></h2>
+      <p class="rv d2">It's one Cargo workspace, layered so the data plane knows nothing about the surfaces built on it. Each milestone has its own test crate and had to pass its gate before the next one began.</p>
+    </div>
+    <div class="layers">
+      <div class="card layer rv"><h4>Milestones<small>M0–M8, each with its own gated test crate</small></h4>
+        <div class="ms">
+          <div class="mi"><b>M0</b><span>Ontology → tables, PII split, durable</span></div>
+          <div class="mi"><b>M1</b><span>Multi-tenant runtime, auth</span></div>
+          <div class="mi"><b>M2</b><span>Governed reactivity</span></div>
+          <div class="mi"><b>M3</b><span>Pack ontology</span></div>
+          <div class="mi"><b>M4</b><span>Schema evolution</span></div>
+          <div class="mi"><b>M5</b><span>Work &amp; comms</span></div>
+          <div class="mi"><b>M6</b><span>Governed ingestion</span></div>
+          <div class="mi"><b>M7</b><span>Context, agents, cost</span></div>
+          <div class="mi"><b>M8</b><span>Authority transfer</span></div>
+        </div>
+      </div>
+      <div class="card layer rv"><h4>Data plane<small>Where governance lives</small></h4>
+        <div class="crates">
+          <span class="crate">tinker-core<span>tenant, ids, blind index</span></span>
+          <span class="crate">tinker-ontology<span>schema → DDL, sealing</span></span>
+          <span class="crate">tinker-query<span>typed compiler</span></span>
+          <span class="crate">tinker-db<span>two stores</span></span>
+          <span class="crate">tinker-vault<span>PII projector</span></span>
+          <span class="crate">tinker-search<span>one search contract</span></span>
+        </div>
+      </div>
+      <div class="card layer rv"><h4>Identity<small>Who, and with what assurance</small></h4>
+        <div class="crates">
+          <span class="crate">tinker-auth<span>WebAuthn, OIDC, tk_ keys</span></span>
+          <span class="crate">tinker-identity<span>sessions, grants</span></span>
+        </div>
+      </div>
+      <div class="card layer rv"><h4>Surfaces<small>Everything built on the plane</small></h4>
+        <div class="crates">
+          <span class="crate">tinker-web<span>Axum, schema builder</span></span>
+          <span class="crate">tinker-apps<span>versioned apps</span></span>
+          <span class="crate">tinker-live<span>SSE grids</span></span>
+          <span class="crate">tinker-comms<span>email outbox</span></span>
+          <span class="crate">tinker-agents<span>context, approvals</span></span>
+          <span class="crate">tinker-ingest<span>connectors, master data</span></span>
+          <span class="crate">tinker-evolve<span>canary, promote</span></span>
+          <span class="crate">tinker-durable<span>workflows on PG</span></span>
+          <span class="crate">tinker-packs<span>installable bundles</span></span>
+          <span class="crate">tinker-transfer<span>strangler migration</span></span>
+          <span class="crate new">tinker-automate<span>keyed automations</span></span>
+        </div>
+      </div>
+      <div class="card layer rv"><h4>Front door<small>For agents and terminals</small></h4>
+        <div class="crates">
+          <span class="crate">tinker-mcp<span>stdio + HTTP/SSE</span></span>
+          <span class="crate">tinker describe<span>self-describing ontology</span></span>
+          <span class="crate">tinker-cli<span>pii verify · retrofit · sweep</span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= EVIDENCE ================= -->
+<section class="sec" id="evidence" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-hero">
+      <span class="num rv">08 — EVIDENCE</span>
+      <h2 class="rv d1">Every claim<br><span class="serif grad-mint">names its test.</span></h2>
+      <p class="rv d2">The status ledger ties each capability to a passing test, and the important ones were checked by breaking the code on purpose to see the test fail. Here are some that guard what this page claims.</p>
+    </div>
+    <div class="evid">
+      <div class="card rv">
+        <ul class="proofs">
+          <li><span class="tick">✓</span><div><code>sensitive_values_are_sealed_masked_findable_and_revealable</code><p>No plaintext in the row or the audit log, exact match through the index, and plaintext only through reveal.</p></div></li>
+          <li><span class="tick">✓</span><div><code>reveal_needs_a_fresh_second_person_approval_for_that_field</code><p>Self-approval, replay and field substitution are all refused.</p></div></li>
+          <li><span class="tick">✓</span><div><code>erasure_crypto_shreds_copies_of_the_ciphertext</code><p>The subject's key is gone, and a restored copy of the ciphertext is refused.</p></div></li>
+          <li><span class="tick">✓</span><div><code>sealed_conditions_route_and_actions_resolve_only_at_send</code><p>Keyed conditions match, and the recipient is resolved only at send.</p></div></li>
+          <li><span class="tick">✓</span><div><code>runs_fail_closed_when_the_author_loses_the_role_and_stop_when_disabled</code><p>An automation never outlives its author's authority.</p></div></li>
+          <li><span class="tick">✓</span><div><code>webauthn_register_then_login_binds_origin_and_assurance</code><p>Phishing origins, counter replay and UV assurance are covered.</p></div></li>
+          <li><span class="tick">✓</span><div><code>oidc_token_abuse_fails_closed</code><p>PKCE, single-use state and nonce binding. A bare id_token is refused.</p></div></li>
+          <li><span class="tick">✓</span><div><code>ingest_seals_sensitive_fields_and_scrubs_landing</code><p>Imported PII is sealed at promotion and scrubbed from the landing tables.</p></div></li>
+        </ul>
+      </div>
+      <div class="side">
+        <div class="card meter rv d1"><div class="big grad-mint">662 / 663</div><div class="bar"><i></i></div><p>Full suite on PostgreSQL 18 with a real browser test, clean under fmt and clippy <code>-D warnings</code>. The one test not run is a timing benchmark, ignored by design. <code>pii verify</code> runs as a gate.</p></div>
+        <div class="card meter rv d2"><div class="big">24h</div><p style="margin-top:10px">A soak test of 4.1M operations over both MCP transports, plus backup and point-in-time-recovery drills with measured RPO/RTO, and an internal adversarial review that found and fixed a real DoS.</p></div>
+        <div class="card limits rv d3"><h3>Not yet</h3><ul>
+          <li>No external security audit. The review was internal and is labeled that way.</li>
+          <li>Nothing is deployed publicly. The <code>deploy/</code> kit is validated locally.</li>
+          <li>Servers queue automation email, but no real provider is set up.</li>
+          <li>Automation actions don't share a transaction across a failed run.</li>
+        </ul></div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= START ================= -->
+<section class="sec" id="start" style="padding-top:0">
+  <div class="wrap">
+    <div class="sec-hero">
+      <span class="num rv">09 — RUN IT</span>
+      <h2 class="rv d1">Four commands<br><span class="serif">to a green suite.</span></h2>
+    </div>
+    <div class="start-grid">
+      <div class="term rv">
+        <div class="term-h"><span class="dots"><i></i><i></i><i></i></span>tinker — zsh</div>
+<pre><span class="c-c"># private PG18 cluster on :5440, random dev secrets, migrations</span>
+<span class="p">$</span> bin/dev-db-mac.sh
+<span class="p">$</span> eval "$(bin/dev-db-mac.sh env)"
+
+<span class="c-c"># full suite (lean build), browser test, then `pii verify`</span>
+<span class="p">$</span> bin/test-mac.sh
+<span class="c-m">test-mac: passed 662 failed 0 ignored 1</span>
+<span class="c-m">test-mac: pii verify ok</span>
+
+<span class="c-c"># the agent front door over stdio (`serve` for HTTP/SSE)</span>
+<span class="p">$</span> TINKER_API_KEY=tk_… cargo run -p tinker-mcp</pre>
+      </div>
+      <div class="card reqs rv d1">
+        <h3>You'll need</h3>
+        <dl>
+          <dt>rust</dt><dd>stable toolchain via rustup</dd>
+          <dt>postgres</dt><dd>18 (Homebrew <code>postgresql@18</code>)</dd>
+          <dt>redis</dt><dd>started by the test script on :16390</dd>
+          <dt>disk</dt><dd>~4 GB for a lean test build</dd>
+        </dl>
+        <p style="margin-top:18px">Then read <a class="doclink" data-doc="docs/pii-sensitive-fields.md" href="docs/pii-sensitive-fields.md">sealed fields</a>, <a class="doclink" data-doc="docs/automations.md" href="docs/automations.md">automations</a> and the <a class="doclink" data-doc="docs/threat-model.md" href="docs/threat-model.md">threat model</a>.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="closing">
+  <div class="atmo" aria-hidden="true"><div class="gridbg"></div><div class="blob b1" style="left:10%;top:20%"></div><div class="blob b2" style="right:5%;top:10%"></div></div>
+  <div class="wrap" style="position:relative;z-index:1">
+    <h2 class="rv">Give people the tools.<br><span class="serif grad-brass">Keep the data.</span></h2>
+    <p class="rv d1">An internal-tool builder where governance is the kernel, not a feature you remember to turn on.</p>
+    <div class="cta rv d2"><a class="btn primary" data-repo href="#start">Get the source</a><a class="btn doclink" data-doc="OVERVIEW.md" href="OVERVIEW.md">Read the overview →</a></div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>Tinker · MIT licensed · Rust + PostgreSQL 18</span>
+    <span><a class="doclink" data-doc="STATUS.md" href="STATUS.md">Status ledger</a> · <a class="doclink" data-doc="docs/threat-model.md" href="docs/threat-model.md">Threat model</a> · <a class="doclink" data-doc="LICENSE" href="LICENSE">License</a></span>
+  </div>
+</footer>
+
+<script>
+(function(){
+  var d=document.documentElement;
+  // Point source and doc links at the GitHub repo when served from GitHub Pages.
+  var h=location.hostname, parts=location.pathname.split('/').filter(Boolean);
+  if(/\.github\.io$/.test(h)){
+    var owner=h.split('.')[0], repo=parts[0]||(owner+'.github.io'), base='https://github.com/'+owner+'/'+repo;
+    document.querySelectorAll('[data-repo]').forEach(function(a){a.href=base;});
+    document.querySelectorAll('[data-doc]').forEach(function(a){a.href=base+'/blob/main/'+a.getAttribute('data-doc');});
+  }
+  // Scroll reveals: content is visible without JS; this only adds motion.
+  if(!('IntersectionObserver' in window)||matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  d.classList.add('js');
+  var io=new IntersectionObserver(function(es){es.forEach(function(e){if(e.isIntersecting){e.target.classList.add('in');io.unobserve(e.target);}});},{rootMargin:'0px 0px -8% 0px',threshold:.08});
+  document.querySelectorAll('.rv').forEach(function(el){io.observe(el);});
+  // Anything already on screen at load shows at once.
+  requestAnimationFrame(function(){document.querySelectorAll('.rv').forEach(function(el){var r=el.getBoundingClientRect();if(r.top<innerHeight)el.classList.add('in');});});
+})();
+</script>
+</body>
+</html>
