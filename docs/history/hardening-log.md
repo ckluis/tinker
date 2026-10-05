@@ -50,7 +50,7 @@ Branch `pii-sensitive-fields` (off `round-1-pg18-hardening`). Design + decisions
 
 **Also fixed on the way:** `deploy/env/tinker.env.template` documented `TINKER_KEK` as base64, but the vault only parses hex, so a deploy following the template could not start.
 
-**Disk:** a full workspace test build reached 22 GB in `target/` and filled the disk. `bin/test-mac.sh` now builds with `CARGO_INCREMENTAL=0` and line-table debug info (about 4 GB).
+**Disk:** a full workspace test build reached 22 GB in `target/` and filled the disk. `bin/test-mac.sh` (now `bin/test.sh`) builds with `CARGO_INCREMENTAL=0` and line-table debug info (about 4 GB).
 
 **Not in this round:** ingest/comms writers into sensitive columns (they fail closed on the UUID type, so the CRM pack's email/phone are deliberately NOT marked sensitive until ingest seals); toggling `sensitive` on a populated field; an MCP-exposed erasure tool.
 

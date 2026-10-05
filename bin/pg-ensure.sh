@@ -36,19 +36,6 @@ if [ ! -x "$PGBIN/initdb" ]; then
         /var/cache/apt/archives/postgresql-16_16.15-0ubuntu0.24.04.1_amd64.deb \
         >/dev/null 2>&1 || true
 fi
-# Fallback: vendored debs survive rolls that wipe the apt cache (2026-09-25).
-if [ ! -x "$PGBIN/initdb" ]; then
-    VENDOR="$HERE/bin/vendor/pg"
-    if [ -f "$VENDOR/postgresql-16_16.15-0ubuntu0.24.04.1_amd64.deb" ]; then
-        echo "pg-ensure: apt cache empty, installing postgresql-16 from vendored debs..."
-        dpkg --force-depends -i "$VENDOR"/libpq5_16.15-0ubuntu0.24.04.1_amd64.deb \
-            "$VENDOR"/postgresql-client-common_257build1.1_all.deb \
-            "$VENDOR"/postgresql-common_257build1.1_all.deb \
-            "$VENDOR"/postgresql-client-16_16.15-0ubuntu0.24.04.1_amd64.deb \
-            "$VENDOR"/postgresql-16_16.15-0ubuntu0.24.04.1_amd64.deb \
-            >/dev/null 2>&1 || true
-    fi
-fi
 [ -x "$PGBIN/initdb" ] || { echo "pg-ensure: FATAL: no postgres binaries" >&2; exit 1; }
 
 # 2. Cluster.

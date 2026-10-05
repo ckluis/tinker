@@ -2852,7 +2852,7 @@ silently serving the wrong store.
 
 ## 2026-09-27 — Item 43: self-describing ontology / `tinker describe` (DONE)
 
-Agent front door, Part 1 (approved spec `SPEC-agent-front-door.md`,
+Agent front door, Part 1 (approved spec `docs/spec-agent-front-door.md`,
 "Do it" 2026-09-26; build order 43 → 44 → 45). `GET /api/describe`
 (catalog) and `GET /api/describe/{slug}` (object), plus `tinker
 describe` on the existing CLI — no new binary.
@@ -2928,7 +2928,7 @@ authentication.
 
 ## 2026-09-27 — Item 44: version-matched agent skill (DONE)
 
-Agent front door, Part 3 (approved spec `SPEC-agent-front-door.md`,
+Agent front door, Part 3 (approved spec `docs/spec-agent-front-door.md`,
 "Do it" 2026-09-26; build order 43 → 44 → 45). The skill
 "Working with Tinker" plus `tinker agent install` / `tinker agent
 verify` on the existing `tinker` binary — no new binary.
@@ -3014,7 +3014,7 @@ comments) in the harness; not renamed to avoid churning item 43.
 
 ## 2026-09-27 — Item 45: MCP front door (`tinker-mcp` stdio server) (DONE)
 
-Agent front door, Part 2 (approved spec `SPEC-agent-front-door.md`,
+Agent front door, Part 2 (approved spec `docs/spec-agent-front-door.md`,
 "Do it" 2026-09-26; build order 43 → 44 → 45 completed). A new
 `tinker-mcp` binary: a **hand-written minimal MCP JSON-RPC stdio
 server** (newline-delimited JSON-RPC 2.0 over stdin/stdout) — no MCP

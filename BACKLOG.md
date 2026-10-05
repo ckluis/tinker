@@ -924,7 +924,7 @@ transfer of ideas only, never copy or vendor Directus code.
   Backend column records byte placement; switching backends without
   migrating fails closed and operator-visible.)
 
-## Agent front door (approved 2026-09-26; spec: SPEC-agent-front-door.md)
+## Agent front door (approved 2026-09-26; spec: docs/spec-agent-front-door.md)
 
 Build in order 43 → 44 → 45. Same non-negotiable gates: full serial
 `cargo test --workspace`, `cargo fmt --all --check`,

@@ -1,10 +1,10 @@
 #!/bin/bash
-# dev-db-mac.sh — macOS (Homebrew) dev PostgreSQL for Tinker.
+# dev-db.sh — a private dev/test PostgreSQL 18 cluster for Tinker.
 #
-# The macOS counterpart of bin/pg-ensure.sh (which targets the Ubuntu
-# cell: apt/dpkg, `su postgres`, tmpfs). Same privilege shape, different
-# plumbing:
-#   1. Homebrew PostgreSQL 18 (override with TINKER_PG_BIN).
+# Runs as your own user on macOS (Homebrew) and Linux (PGDG packages),
+# and in CI. No root, no system cluster:
+#   1. PostgreSQL 18 binaries: TINKER_PG_BIN, else Homebrew
+#      postgresql@18, else /usr/lib/postgresql/18/bin, else pg_config.
 #   2. A private cluster in .pgdata/ (gitignored) on 127.0.0.1:$PORT —
 #      never the machine's default cluster. Superuser `postgres` over the
 #      cluster's own unix socket (trust); TCP is scram-sha-256.
@@ -15,12 +15,20 @@
 #   5. Migrations via the tinker-db `migrate` example, then the same
 #      count + checksum verification as pg-ensure.sh §5.
 #
-# Idempotent. `bin/dev-db-mac.sh stop` stops the cluster;
-# `bin/dev-db-mac.sh env` prints `export` lines for the test env.
+# Idempotent. `bin/dev-db.sh stop` stops the cluster;
+# `bin/dev-db.sh env` prints `export` lines for the test env.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
-PGBIN="${TINKER_PG_BIN:-/opt/homebrew/opt/postgresql@18/bin}"
+if [ -n "${TINKER_PG_BIN:-}" ]; then
+  PGBIN="$TINKER_PG_BIN"
+elif [ -x /opt/homebrew/opt/postgresql@18/bin/initdb ]; then
+  PGBIN=/opt/homebrew/opt/postgresql@18/bin
+elif [ -x /usr/lib/postgresql/18/bin/initdb ]; then
+  PGBIN=/usr/lib/postgresql/18/bin
+else
+  PGBIN="$(pg_config --bindir 2>/dev/null || true)"
+fi
 PGDATA="$HERE/.pgdata"
 PORT="${TINKER_PG_PORT:-5440}"
 SECRETS="$HERE/.secrets/.env.test"
@@ -129,4 +137,4 @@ fi
 (cd "$HERE" && cargo run -q -p tinker-db --example verify-migrations -- \
   "$HERE/crates/tinker-db/migrations/core" "$HERE/crates/tinker-db/migrations/pii")
 
-echo "dev-db: ready on 127.0.0.1:$PORT ($("$PGBIN/postgres" --version)); env: eval \"\$(bin/dev-db-mac.sh env)\""
+echo "dev-db: ready on 127.0.0.1:$PORT ($("$PGBIN/postgres" --version)); env: eval \"\$(bin/dev-db.sh env)\""

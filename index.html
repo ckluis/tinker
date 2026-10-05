@@ -366,7 +366,7 @@ footer a{color:var(--dim);text-decoration:none}
       <a href="#agents">Agents</a>
       <a href="#evidence">Evidence</a>
     </div>
-    <a class="btn" data-repo href="#start">Get the source →</a>
+    <a class="btn" href="https://github.com/ckluis/tinker">View on GitHub →</a>
   </div>
 </nav>
 
@@ -846,14 +846,14 @@ approvals { action: "approve",
     <div class="start-grid">
       <div class="term rv">
         <div class="term-h"><span class="dots"><i></i><i></i><i></i></span>tinker — zsh</div>
-<pre><span class="c-c"># private PG18 cluster on :5440, random dev secrets, migrations</span>
-<span class="p">$</span> bin/dev-db-mac.sh
-<span class="p">$</span> eval "$(bin/dev-db-mac.sh env)"
+<pre><span class="c-c"># private PG18 cluster on :5440 (macOS or Linux), dev secrets, migrations</span>
+<span class="p">$</span> bin/dev-db.sh
+<span class="p">$</span> eval "$(bin/dev-db.sh env)"
 
 <span class="c-c"># full suite (lean build), browser test, then `pii verify`</span>
-<span class="p">$</span> bin/test-mac.sh
-<span class="c-m">test-mac: passed 662 failed 0 ignored 1</span>
-<span class="c-m">test-mac: pii verify ok</span>
+<span class="p">$</span> bin/test.sh
+<span class="c-m">test: passed 662 failed 0 ignored 1</span>
+<span class="c-m">test: pii verify ok</span>
 
 <span class="c-c"># the agent front door over stdio (`serve` for HTTP/SSE)</span>
 <span class="p">$</span> TINKER_API_KEY=tk_… cargo run -p tinker-mcp</pre>
@@ -862,11 +862,11 @@ approvals { action: "approve",
         <h3>You'll need</h3>
         <dl>
           <dt>rust</dt><dd>stable toolchain via rustup</dd>
-          <dt>postgres</dt><dd>18 (Homebrew <code>postgresql@18</code>)</dd>
+          <dt>postgres</dt><dd>18 (Homebrew <code>postgresql@18</code> or apt.postgresql.org)</dd>
           <dt>redis</dt><dd>started by the test script on :16390</dd>
           <dt>disk</dt><dd>~4 GB for a lean test build</dd>
         </dl>
-        <p style="margin-top:18px">Then read <a class="doclink" data-doc="docs/pii-sensitive-fields.md" href="docs/pii-sensitive-fields.md">sealed fields</a>, <a class="doclink" data-doc="docs/automations.md" href="docs/automations.md">automations</a> and the <a class="doclink" data-doc="docs/threat-model.md" href="docs/threat-model.md">threat model</a>.</p>
+        <p style="margin-top:18px">Then read <a class="doclink" href="https://github.com/ckluis/tinker/blob/main/docs/pii-sensitive-fields.md">sealed fields</a>, <a class="doclink" href="https://github.com/ckluis/tinker/blob/main/docs/automations.md">automations</a> and the <a class="doclink" href="https://github.com/ckluis/tinker/blob/main/docs/threat-model.md">threat model</a>.</p>
       </div>
     </div>
   </div>
@@ -877,27 +877,20 @@ approvals { action: "approve",
   <div class="wrap" style="position:relative;z-index:1">
     <h2 class="rv">Give people the tools.<br><span class="serif grad-brass">Keep the data.</span></h2>
     <p class="rv d1">An internal-tool builder where governance is the kernel, not a feature you remember to turn on.</p>
-    <div class="cta rv d2"><a class="btn primary" data-repo href="#start">Get the source</a><a class="btn doclink" data-doc="OVERVIEW.md" href="OVERVIEW.md">Read the overview →</a></div>
+    <div class="cta rv d2"><a class="btn primary" href="https://github.com/ckluis/tinker">Get the source</a><a class="btn doclink" href="https://github.com/ckluis/tinker/blob/main/docs/overview.md">Read the overview →</a></div>
   </div>
 </section>
 
 <footer>
   <div class="wrap">
     <span>Tinker · MIT licensed · Rust + PostgreSQL 18</span>
-    <span><a class="doclink" data-doc="STATUS.md" href="STATUS.md">Status ledger</a> · <a class="doclink" data-doc="docs/threat-model.md" href="docs/threat-model.md">Threat model</a> · <a class="doclink" data-doc="LICENSE" href="LICENSE">License</a></span>
+    <span><a class="doclink" href="https://github.com/ckluis/tinker/blob/main/STATUS.md">Status ledger</a> · <a class="doclink" href="https://github.com/ckluis/tinker/blob/main/docs/threat-model.md">Threat model</a> · <a class="doclink" href="https://github.com/ckluis/tinker/blob/main/LICENSE">License</a></span>
   </div>
 </footer>
 
 <script>
 (function(){
   var d=document.documentElement;
-  // Point source and doc links at the GitHub repo when served from GitHub Pages.
-  var h=location.hostname, parts=location.pathname.split('/').filter(Boolean);
-  if(/\.github\.io$/.test(h)){
-    var owner=h.split('.')[0], repo=parts[0]||(owner+'.github.io'), base='https://github.com/'+owner+'/'+repo;
-    document.querySelectorAll('[data-repo]').forEach(function(a){a.href=base;});
-    document.querySelectorAll('[data-doc]').forEach(function(a){a.href=base+'/blob/main/'+a.getAttribute('data-doc');});
-  }
   // Scroll reveals: content is visible without JS; this only adds motion.
   if(!('IntersectionObserver' in window)||matchMedia('(prefers-reduced-motion: reduce)').matches) return;
   d.classList.add('js');

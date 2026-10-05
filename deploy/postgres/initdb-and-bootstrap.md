@@ -107,7 +107,7 @@ $PGBIN/psql -h /var/run/postgresql -d tinker_core -v ON_ERROR_STOP=1 -q \
 ```
 The block is idempotent: re-running converges passwords and grants
 instead of duplicating them. Validated 2026-09-28 on a scratch PG16
-cluster (re-run 2026-09-30 against PG 18.6 by bin/dev-db-mac.sh, which
+cluster (re-run 2026-09-30 against PG 18.6 by bin/dev-db.sh, which
 mirrors this block): all four roles created with the documented attributes
 (login; CREATEROLE on owners only; NOSUPERUSER), SCRAM password login
 verified over TCP for each role, wrong password rejected, and a second

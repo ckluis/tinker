@@ -54,7 +54,7 @@ default-members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/tinker-platform/tinker"
+repository = "https://github.com/ckluis/tinker"
 
 [workspace.dependencies]
 async-trait = "0.1"
