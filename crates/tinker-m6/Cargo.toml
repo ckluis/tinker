@@ -1,0 +1,38 @@
+[package]
+name = "tinker-m6"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[test]]
+name = "m6_ingest"
+path = "tests/m6_ingest.rs"
+
+[[test]]
+name = "mapping_ai"
+path = "tests/mapping_ai.rs"
+
+[[test]]
+name = "mapping_suggest"
+path = "tests/mapping_suggest.rs"
+
+[dependencies]
+tinker-core.workspace = true
+tinker-db.workspace = true
+tinker-ingest.workspace = true
+tinker-ontology.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+axum.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+axum.workspace = true
+async-trait.workspace = true
+tinker-apps.workspace = true
+tinker-ontology.workspace = true
+tinker-packs.workspace = true
+tinker-agents.workspace = true

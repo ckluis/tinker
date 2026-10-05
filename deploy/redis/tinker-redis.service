@@ -1,0 +1,38 @@
+# Sample systemd unit: production Redis for Tinker
+#
+# Install: copy to /etc/systemd/system/tinker-redis.service,
+# `systemctl daemon-reload`, `systemctl enable --now tinker-redis`.
+# The redis-server binary path below is the Ubuntu redis-server 7.0
+# package location; adjust if vendored elsewhere.
+[Unit]
+Description=Tinker production Redis (session store + signal bus)
+Documentation=file:///opt/tinker/deploy/redis/redis.conf
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+User=redis
+Group=redis
+ExecStart=/usr/bin/redis-server /etc/redis/tinker-redis.conf
+# AUTH for the stop command comes from REDISCLI_AUTH (read by redis-cli
+# from the environment), NOT from `-a` on the command line — `-a`
+# would expose the password in `ps` output. /etc/tinker/redis.env must
+# therefore define REDISCLI_AUTH=<the requirepass value>, mode 0600,
+# owned by root:redis.
+ExecStop=/usr/bin/redis-cli shutdown
+EnvironmentFile=/etc/tinker/redis.env
+TimeoutStopSec=60
+# Give redis time to fsync the AOF on shutdown; SIGKILL only after the
+# timeout.
+Restart=on-failure
+RestartSec=10s
+# Sandboxing: only the data dir, log dir and run dir are writable.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/redis /var/log/redis /var/run/redis
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

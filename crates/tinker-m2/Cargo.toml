@@ -1,0 +1,45 @@
+[package]
+name = "tinker-m2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+tinker-core.workspace = true
+tinker-db.workspace = true
+tinker-auth.workspace = true
+tinker-durable.workspace = true
+tinker-identity.workspace = true
+tinker-live.workspace = true
+tinker-ontology.workspace = true
+tinker-query.workspace = true
+tinker-search.workspace = true
+tinker-web.workspace = true
+tinker-apps.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tower.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rand.workspace = true
+tokio-stream.workspace = true
+http-body-util = "0.1"
+
+[[test]]
+name = "m2_collision"
+path = "tests/m2_collision.rs"
+
+[[test]]
+name = "m2_reactivity"
+path = "tests/m2_reactivity.rs"
+
+[[test]]
+name = "m2_perf"
+path = "tests/m2_perf.rs"
+
+[[test]]
+name = "m2_stream"
+path = "tests/m2_stream.rs"

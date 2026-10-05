@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Sign in — {{ host_name }}</title>
+<link rel="stylesheet" href="/assets/tinker.css" />
+</head>
+<body>
+<main style="max-width: 28rem; margin: 4rem auto; padding: 0 1rem;">
+  <h1>Sign in to {{ host_name }}</h1>
+  <p>Choose an authentication method. Authorization is decided by Tinker
+     afterwards — the method you pick cannot change what you may do.</p>
+
+  <section>
+    <h2>Passkey</h2>
+    <form id="passkey-form">
+      <label>Organization ID <input name="organization_id" required /></label>
+      <label>Workspace ID <input name="workspace_id" required /></label>
+      <label>Actor ID <input name="actor_id" required /></label>
+      <button type="submit">Sign in with passkey</button>
+    </form>
+  </section>
+
+  <section>
+    <h2>Single sign-on</h2>
+    <form id="oidc-form">
+      <label>Organization ID <input name="organization_id" required /></label>
+      <label>Workspace ID <input name="workspace_id" required /></label>
+      <button type="submit">Continue with SSO</button>
+    </form>
+  </section>
+</main>
+<script src="/assets/tinker.js"></script>
+</body>
+</html>

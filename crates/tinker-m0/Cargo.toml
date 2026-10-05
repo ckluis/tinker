@@ -1,0 +1,66 @@
+[package]
+name = "tinker-m0"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dev-dependencies]
+tinker-agents.workspace = true
+tinker-core.workspace = true
+tinker-db.workspace = true
+tinker-auth.workspace = true
+tinker-durable.workspace = true
+tinker-evolve.workspace = true
+tinker-ontology.workspace = true
+tinker-query.workspace = true
+tinker-search.workspace = true
+tinker-transfer.workspace = true
+tinker-vault.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
+
+[[test]]
+name = "m0_ontology"
+path = "tests/m0_ontology.rs"
+
+[[test]]
+name = "m0_durable"
+path = "tests/m0_durable.rs"
+
+[[test]]
+name = "m0_pii"
+path = "tests/m0_pii.rs"
+
+[[test]]
+name = "m0_search"
+path = "tests/m0_search.rs"
+
+[[test]]
+name = "m0_query"
+path = "tests/m0_query.rs"
+
+[[test]]
+name = "m0_row_filters"
+path = "tests/m0_row_filters.rs"
+
+[[test]]
+name = "m0_schema_snapshot"
+path = "tests/m0_schema_snapshot.rs"
+
+[[test]]
+name = "m0_record_lifecycle"
+path = "tests/m0_record_lifecycle.rs"
+
+[[test]]
+name = "m0_dashboards"
+path = "tests/m0_dashboards.rs"
+
+[[test]]
+name = "dr_seed"
+path = "tests/dr_seed.rs"

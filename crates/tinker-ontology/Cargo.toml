@@ -1,0 +1,33 @@
+[package]
+name = "tinker-ontology"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tinker-core.workspace = true
+tinker-db.workspace = true
+tinker-vault.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+sqlx = { workspace = true, features = ["bigdecimal"] }
+bigdecimal.workspace = true
+regex.workspace = true
+uuid.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tinker-agents.workspace = true
+
+[[test]]
+name = "mutate_validation"
+path = "tests/mutate_validation.rs"
+
+[[test]]
+name = "mutate_file_fields"
+path = "tests/mutate_file_fields.rs"

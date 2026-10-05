@@ -1,0 +1,463 @@
+{
+  "git": "0722e05",
+  "item": 47,
+  "profile": "debug",
+  "samples": {
+    "create_record_shape": {
+      "record_id": "<uuid>",
+      "version": 1
+    },
+    "describe": {
+      "api_slug": "benchobja60ffadb",
+      "fields": [
+        {
+          "api_name": "email",
+          "field_type": "text",
+          "label": "email",
+          "max_pii_class": "none",
+          "nullable": true,
+          "postgres_type": "TEXT",
+          "required": false,
+          "validation": {}
+        },
+        {
+          "api_name": "name",
+          "field_type": "text",
+          "label": "name",
+          "max_pii_class": "none",
+          "nullable": true,
+          "postgres_type": "TEXT",
+          "required": true,
+          "validation": {}
+        },
+        {
+          "api_name": "notes",
+          "field_type": "text",
+          "label": "notes",
+          "max_pii_class": "none",
+          "nullable": true,
+          "postgres_type": "TEXT",
+          "required": false,
+          "validation": {}
+        }
+      ],
+      "lifecycle_enabled": false,
+      "mutation": {
+        "error_taxonomy": [
+          {
+            "class": "invalid",
+            "http_status": 400,
+            "meaning": "the write violates a validation rule, names an unknown field, or attempts an illegal transition"
+          },
+          {
+            "class": "forbidden",
+            "http_status": 403,
+            "meaning": "the caller lacks permission; for objects or fields the caller cannot see this is indistinguishable from not_found — there is no existence oracle"
+          },
+          {
+            "class": "not_found",
+            "http_status": 404,
+            "meaning": "unknown object, field, or record — same response shape as hidden"
+          },
+          {
+            "class": "conflict",
+            "http_status": 409,
+            "meaning": "version or state conflict (e.g. a second in-flight draft for the same record), or a client version-pinning mismatch"
+          }
+        ],
+        "write_path": "governed",
+        "write_path_note": "all record writes pass the governed mutation connector, in order: write presets are applied first (a preset can satisfy `required`), then server-side validation rules, then file-field validation (the file must exist, be active, belong to this organization, and fit the field's max_pii_class). No write path bypasses this ordering"
+      },
+      "name": "benchobja60ffadb",
+      "ontology_version": "0043",
+      "reads": {
+        "intent_shape": {
+          "filters": [
+            {
+              "field": "api_name",
+              "op": "eq|ne|lt|lte|gt|gte|in|contains|starts_with|is_null|is_not_null",
+              "value": "<json>"
+            }
+          ],
+          "from": "<object id (uuid)>",
+          "limit": 100,
+          "order": [
+            {
+              "descending": false,
+              "field": "api_name"
+            }
+          ],
+          "schema_version": "active",
+          "select": [
+            "api_name",
+            "relation_field.api_name"
+          ]
+        },
+        "notes": [
+          "select uses field api_names; \"a.b\" traverses one declared relation hop",
+          "filters and sorts on fields hidden from the caller's role are rejected outright — a boolean oracle on a hidden column would leak its values",
+          "row policies (see row_policy above) AND with the tenant predicate at compile time: policy before ranking",
+          "query plans are cached per (organization, plan hash); the hash covers the row-policy SQL and actor binds, so roles never share an unauthorized plan"
+        ],
+        "query_endpoint": "POST /api/query"
+      },
+      "relations": [],
+      "row_policy": {
+        "applies": false,
+        "filter_count": 0,
+        "summary": "default-open: no row policy for this role on this object"
+      },
+      "scope": "organization",
+      "tinker_version": "0.1.0"
+    },
+    "get_record": {
+      "record": {
+        "__id": "a84c5ea9-c748-460b-bc3c-da7c6bd47ffb",
+        "email": "bench-000@example.com",
+        "name": "bench-000",
+        "notes": "seeded note 0"
+      }
+    },
+    "query": {
+      "cached": true,
+      "object_id": "01a0e918-9069-7502-9b3f-6ff5ec8198b0",
+      "plan_hash": "df4033b8719d5fb4e22237caa865261f480da9a881df779901e2edbb34cb2c20",
+      "rows": [
+        {
+          "__id": "a84c5ea9-c748-460b-bc3c-da7c6bd47ffb",
+          "email": "bench-000@example.com",
+          "name": "bench-000"
+        },
+        {
+          "__id": "264bb815-0407-40ed-9a7d-1b497dc446fa",
+          "email": "bench-001@example.com",
+          "name": "bench-001"
+        },
+        {
+          "__id": "33d63dd8-76a7-4677-8334-a06b00a3042b",
+          "email": "bench-002@example.com",
+          "name": "bench-002"
+        },
+        {
+          "__id": "30067951-745e-4885-b9d7-4aa09ca21233",
+          "email": "bench-003@example.com",
+          "name": "bench-003"
+        },
+        {
+          "__id": "dc994fef-36dd-45fd-8182-2b112462c2e9",
+          "email": "bench-004@example.com",
+          "name": "bench-004"
+        },
+        {
+          "__id": "6d0408ec-665a-465a-a498-05a0e6114a5e",
+          "email": "bench-005@example.com",
+          "name": "bench-005"
+        },
+        {
+          "__id": "6d27b82f-e6bc-4f21-8e69-142265a5e061",
+          "email": "bench-006@example.com",
+          "name": "bench-006"
+        },
+        {
+          "__id": "e17350f9-6cc4-4e46-82e0-769a49471c2b",
+          "email": "bench-007@example.com",
+          "name": "bench-007"
+        },
+        {
+          "__id": "94c0fd9c-0b9b-410a-aa80-6141d82947be",
+          "email": "bench-008@example.com",
+          "name": "bench-008"
+        },
+        {
+          "__id": "5361b375-df62-48db-af17-65b04c0e865a",
+          "email": "bench-009@example.com",
+          "name": "bench-009"
+        },
+        {
+          "__id": "2ef75287-17b5-45fe-852b-bc82eba73e42",
+          "email": "bench-010@example.com",
+          "name": "bench-010"
+        },
+        {
+          "__id": "358890f9-992f-4217-bfd0-89c833543185",
+          "email": "bench-011@example.com",
+          "name": "bench-011"
+        },
+        {
+          "__id": "abce7542-fcc3-4dbe-8cdb-ef7522a23067",
+          "email": "bench-012@example.com",
+          "name": "bench-012"
+        },
+        {
+          "__id": "d8a97507-21bb-42fc-abf3-e37ff9a5b5d9",
+          "email": "bench-013@example.com",
+          "name": "bench-013"
+        },
+        {
+          "__id": "bdbb5826-a50a-4b74-b3f3-3430d85131d0",
+          "email": "bench-014@example.com",
+          "name": "bench-014"
+        },
+        {
+          "__id": "b345765a-0178-4a91-83c0-dda1ab107417",
+          "email": "bench-015@example.com",
+          "name": "bench-015"
+        },
+        {
+          "__id": "7ea13c74-e030-4e82-bbea-24b84d305ff6",
+          "email": "bench-016@example.com",
+          "name": "bench-016"
+        },
+        {
+          "__id": "a4af54f8-26b0-4cc0-8261-09b8664ebf93",
+          "email": "bench-017@example.com",
+          "name": "bench-017"
+        },
+        {
+          "__id": "ad2d2667-6bfb-4f54-9270-bf7fd2cc0e58",
+          "email": "bench-018@example.com",
+          "name": "bench-018"
+        },
+        {
+          "__id": "a8f1dd10-d81d-4f4a-a8eb-e50712c8531c",
+          "email": "bench-019@example.com",
+          "name": "bench-019"
+        },
+        {
+          "__id": "07be7ef4-b621-432a-978b-60e0e9e75e8a",
+          "email": "bench-020@example.com",
+          "name": "bench-020"
+        },
+        {
+          "__id": "3605db14-d18e-448b-ac7b-19f7a85b3639",
+          "email": "bench-021@example.com",
+          "name": "bench-021"
+        },
+        {
+          "__id": "10ff9b84-eef5-472b-99dd-6c99511f2810",
+          "email": "bench-022@example.com",
+          "name": "bench-022"
+        },
+        {
+          "__id": "af70a0d4-b702-45dc-84e5-5880281478f6",
+          "email": "bench-023@example.com",
+          "name": "bench-023"
+        },
+        {
+          "__id": "01c3c521-1517-4630-a5c3-ca9d672ad591",
+          "email": "bench-024@example.com",
+          "name": "bench-024"
+        },
+        {
+          "__id": "6495b89b-2ada-4ee2-8762-71587a312a5b",
+          "email": "bench-025@example.com",
+          "name": "bench-025"
+        },
+        {
+          "__id": "1aa28f34-eb85-42cc-9a3d-6fe559b069c5",
+          "email": "bench-026@example.com",
+          "name": "bench-026"
+        },
+        {
+          "__id": "615cecbb-30fc-4887-bc21-6e178bfe4d82",
+          "email": "bench-027@example.com",
+          "name": "bench-027"
+        },
+        {
+          "__id": "3650d7b3-6f4f-43bb-bdc4-79374bb82626",
+          "email": "bench-028@example.com",
+          "name": "bench-028"
+        },
+        {
+          "__id": "95d30a6f-4ed4-409f-87ae-a2c60474e9ab",
+          "email": "bench-029@example.com",
+          "name": "bench-029"
+        },
+        {
+          "__id": "6345bde8-ed29-44b5-900c-a6df9fa8cf7c",
+          "email": "bench-030@example.com",
+          "name": "bench-030"
+        },
+        {
+          "__id": "eccdd4dc-1a52-4fbd-80da-3fd005b5844d",
+          "email": "bench-031@example.com",
+          "name": "bench-031"
+        },
+        {
+          "__id": "fe04317c-59c8-47bc-b383-2bfb67fbdebf",
+          "email": "bench-032@example.com",
+          "name": "bench-032"
+        },
+        {
+          "__id": "65cddfbb-be33-4e87-9b15-46f6b3c67534",
+          "email": "bench-033@example.com",
+          "name": "bench-033"
+        },
+        {
+          "__id": "4d5afe44-7ba2-4a17-8a80-d276bed7d1b6",
+          "email": "bench-034@example.com",
+          "name": "bench-034"
+        },
+        {
+          "__id": "3529fa03-c767-4513-b5d0-b9d276af60a7",
+          "email": "bench-035@example.com",
+          "name": "bench-035"
+        },
+        {
+          "__id": "3af23b4c-3c22-4233-8d06-ade60b3210bc",
+          "email": "bench-036@example.com",
+          "name": "bench-036"
+        },
+        {
+          "__id": "70fcbfe9-c8b3-4806-886b-6ad082faaff5",
+          "email": "bench-037@example.com",
+          "name": "bench-037"
+        },
+        {
+          "__id": "1b017bda-ffcf-4656-83e5-ebb9bd5b3bf2",
+          "email": "bench-038@example.com",
+          "name": "bench-038"
+        },
+        {
+          "__id": "7df138ca-c044-4e7f-84fe-cfa00740f073",
+          "email": "bench-039@example.com",
+          "name": "bench-039"
+        },
+        {
+          "__id": "f1126a1f-9190-4c41-bc5b-174bd8482c0a",
+          "email": "bench-040@example.com",
+          "name": "bench-040"
+        },
+        {
+          "__id": "1cdf9b5f-72fc-4e75-8045-abc37db4084e",
+          "email": "bench-041@example.com",
+          "name": "bench-041"
+        },
+        {
+          "__id": "418e77dc-47ea-4323-8289-87f2a19e9aae",
+          "email": "bench-042@example.com",
+          "name": "bench-042"
+        },
+        {
+          "__id": "50907b9f-0be6-4659-9ce0-38796f24b951",
+          "email": "bench-043@example.com",
+          "name": "bench-043"
+        },
+        {
+          "__id": "8c2bdc79-40a6-4634-a6a5-de3289a354c4",
+          "email": "bench-044@example.com",
+          "name": "bench-044"
+        },
+        {
+          "__id": "7368492d-fd00-4fdc-bcbe-33726b0cdb43",
+          "email": "bench-045@example.com",
+          "name": "bench-045"
+        },
+        {
+          "__id": "5a149385-99c1-4a2a-8f1b-a9c38a51c0a6",
+          "email": "bench-046@example.com",
+          "name": "bench-046"
+        },
+        {
+          "__id": "0beec2f7-0c60-48d5-afd7-3503e2c4e697",
+          "email": "bench-047@example.com",
+          "name": "bench-047"
+        },
+        {
+          "__id": "f5dc08e1-24bc-42ed-87de-be6b3fc4db84",
+          "email": "bench-048@example.com",
+          "name": "bench-048"
+        },
+        {
+          "__id": "f9d52afb-9aed-4f4e-b428-d2e0a6061c05",
+          "email": "bench-049@example.com",
+          "name": "bench-049"
+        }
+      ]
+    }
+  },
+  "transports": {
+    "http": {
+      "create_record": {
+        "max_us": 25933,
+        "mean_us": 7687,
+        "min_us": 4717,
+        "n": 150,
+        "p50_us": 6397,
+        "p99_us": 22179
+      },
+      "describe": {
+        "max_us": 35238,
+        "mean_us": 7266,
+        "min_us": 4458,
+        "n": 300,
+        "p50_us": 5822,
+        "p99_us": 23151
+      },
+      "query_hit": {
+        "max_us": 42346,
+        "mean_us": 11007,
+        "min_us": 7033,
+        "n": 300,
+        "p50_us": 8740,
+        "p99_us": 34597
+      },
+      "query_hit_rate": 1.0,
+      "query_miss": {
+        "max_us": 82219,
+        "mean_us": 13151,
+        "min_us": 8638,
+        "n": 150,
+        "p50_us": 11051,
+        "p99_us": 77690
+      },
+      "query_miss_rate": 1.0,
+      "rss_kb": {
+        "end": 19068,
+        "peak": 19068,
+        "startup": 15996
+      }
+    },
+    "stdio": {
+      "create_record": {
+        "max_us": 59915,
+        "mean_us": 5653,
+        "min_us": 2912,
+        "n": 150,
+        "p50_us": 4207,
+        "p99_us": 41132
+      },
+      "describe": {
+        "max_us": 70750,
+        "mean_us": 4066,
+        "min_us": 2625,
+        "n": 300,
+        "p50_us": 3260,
+        "p99_us": 12249
+      },
+      "query_hit": {
+        "max_us": 85746,
+        "mean_us": 7928,
+        "min_us": 5071,
+        "n": 300,
+        "p50_us": 6554,
+        "p99_us": 37825
+      },
+      "query_hit_rate": 1.0,
+      "query_miss": {
+        "max_us": 158839,
+        "mean_us": 12005,
+        "min_us": 6485,
+        "n": 150,
+        "p50_us": 9063,
+        "p99_us": 74738
+      },
+      "query_miss_rate": 1.0,
+      "rss_kb": {
+        "end": 16952,
+        "peak": 16952,
+        "startup": 28
+      }
+    }
+  }
+}

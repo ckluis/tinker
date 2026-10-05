@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same lean build as bin/test.sh: a full debug build of every test
+  # binary does not fit on a runner.
+  CARGO_INCREMENTAL: "0"
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
+jobs:
+  test:
+    # Branch pushes in this repo already run on `push`; `pull_request`
+    # covers forks.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+
+      - name: Install PostgreSQL 18 and Redis
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -yq postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -yq postgresql-18 redis-server
+          /usr/lib/postgresql/18/bin/postgres --version
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Dev database
+        run: bin/dev-db.sh
+
+      - name: Clippy
+        run: |
+          eval "$(bin/dev-db.sh env)"
+          DATABASE_URL="$TINKER_CORE_OWNER_URL" cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: |
+          # Ubuntu 24.04 blocks the unprivileged user namespaces Chrome's
+          # sandbox needs; the browser test runs the system Chrome headless.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bin/test.sh
+
+      - name: Failure details
+        if: failure()
+        run: |
+          LOG=$(ls -t target/test-runs/*.log 2>/dev/null | head -1)
+          [ -n "$LOG" ] || exit 0
+          grep -E "^test .* FAILED$|panicked at" "$LOG" | head -50 || true
+          tail -200 "$LOG"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-log
+          path: target/test-runs/
+          if-no-files-found: ignore

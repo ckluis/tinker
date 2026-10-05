@@ -1,0 +1,41 @@
+# Sample systemd unit: production PostgreSQL 18 for Tinker
+#
+# Install: copy to /etc/systemd/system/tinker-postgres.service,
+# `systemctl daemon-reload`, `systemctl enable --now tinker-postgres`.
+# Adjust PGDATA if the data dir lives elsewhere (keep the unit and
+# postgresql.conf's log_directory consistent).
+[Unit]
+Description=Tinker production PostgreSQL 18
+Documentation=file:///opt/tinker/deploy/postgres/initdb-and-bootstrap.md
+After=network.target
+Wants=network.target
+
+[Service]
+Type=notify
+User=postgres
+Group=postgres
+Environment=PGDATA=/var/lib/postgresql/18/prod
+# The Debian pg_ctlcluster wrapper is NOT used here on purpose: the
+# cluster is a plain initdb cluster owned by this unit, so there is
+# exactly one way to start it.
+ExecStart=/usr/lib/postgresql/18/bin/postgres -D /var/lib/postgresql/18/prod
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGINT
+# Fast-but-clean shutdown: SIGINT => fast shutdown (aborts transactions,
+# checkpoints cleanly); give checkpoints time before SIGKILL.
+TimeoutSec=300
+# Restart on crash, not on clean stops.
+Restart=on-failure
+RestartSec=10s
+# The postmaster must never be OOM-killed before expendable processes.
+OOMScoreAdjust=-200
+# Sandboxing: the data dir and WAL spool are the only writable paths.
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/postgresql /var/run/postgresql
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+[package]
+name = "tinker-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tinker-core.workspace = true
+tinker-db.workspace = true
+tinker-ontology.workspace = true
+tinker-query.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tokio.workspace = true
+sqlx = { workspace = true, features = ["bigdecimal"] }
+bigdecimal.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+axum.workspace = true
